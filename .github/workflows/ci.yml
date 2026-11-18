@@ -1,0 +1,58 @@
+# Dart checks for every plugin and example app, on pull requests (including
+# the weekly upstream-sync PR from LG) and pushes to main. No TV is needed.
+#
+#   - flutter analyze: fails on errors. Warnings and infos are reported but
+#     do not fail the job, since LG's upstream code has some.
+#   - flutter test: for packages that have a test/ folder.
+#
+# Plain Flutter is used on purpose: flutter-webos would generate webOS runner
+# files inside the plugin folders. The plugins' native webOS code is built,
+# and checked against each webOS firmware, by flutter-webos's
+# "Firmware compatibility" workflow, which builds the test apps from main.
+name: Plugin checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugins-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dart:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.38.10
+          channel: stable
+          cache: true
+      - name: Analyze
+        run: |
+          status=0
+          for pkg in $(find packages -name pubspec.yaml -not -path '*/.dart_tool/*' | sort | xargs -n1 dirname); do
+            echo "::group::$pkg"
+            (cd "$pkg" && flutter pub get && flutter analyze --no-fatal-warnings --no-fatal-infos) \
+              || { echo "::error::analyze failed: $pkg"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
+      - name: Test
+        run: |
+          status=0
+          for t in $(find packages -mindepth 2 -maxdepth 3 -type d -name test -not -path '*/linux/*' | sort); do
+            pkg=$(dirname "$t")
+            [ -f "$pkg/pubspec.yaml" ] || continue
+            echo "::group::$pkg"
+            (cd "$pkg" && flutter test) || { echo "::error::tests failed: $pkg"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
