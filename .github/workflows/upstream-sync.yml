@@ -1,0 +1,115 @@
+# Weekly merge of LG's upstream main into this repository.
+# Clean merge: (re)opens a pull request from the `upstream-sync` branch.
+# Conflict: opens (or comments on) an issue with the conflicting files, so a
+# maintainer can merge by hand:
+#   git fetch upstream && git merge upstream/main
+# Limit: the Actions token can't push changes to .github/workflows. If LG
+# ever adds or edits workflow files there, merge that update by hand.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: lg-flutter-webos/${{ github.event.repository.name }}
+  UPSTREAM_BRANCH: main
+  BASE_BRANCH: main
+  SYNC_BRANCH: upstream-sync
+  LABEL: upstream-sync
+
+jobs:
+  sync:
+    if: github.repository_owner == 'Webos-Flutter-Legacy-TV'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          behind=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")" >> "$GITHUB_OUTPUT"
+          echo "${behind} new upstream commit(s)"
+
+      - name: Merge
+        id: merge
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${SYNC_BRANCH}"
+          if git merge --no-edit --no-ff "upstream/${UPSTREAM_BRANCH}" \
+               -m "Merge ${UPSTREAM_REPO}@${{ steps.fetch.outputs.upstream_sha }} into ${BASE_BRANCH}"; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort
+          fi
+
+      - name: Ensure label
+        if: steps.fetch.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh label create "$LABEL" --color 1d76db --description "Merging LG's upstream changes" --force
+
+      - name: Open or update pull request
+        if: steps.merge.outputs.clean == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+          UPSTREAM_SHA: ${{ steps.fetch.outputs.upstream_sha }}
+        run: |
+          git push --force origin "${SYNC_BRANCH}"
+          log=$(git log --oneline --no-merges "${BASE_BRANCH}..upstream/${UPSTREAM_BRANCH}" | head -50)
+          body=$(printf '%s\n\n%s\n\n```\n%s\n```\n\n%s\n' \
+            "Merges ${BEHIND} new commit(s) from [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) (\`${UPSTREAM_SHA}\`) into \`${BASE_BRANCH}\`. The merge had no conflicts." \
+            "Upstream commits:" "$log" \
+            "Before merging: check that nothing under \`legacy-webos/\` or the plugin fixes is affected, build a test app with \`--legacy\`, and run it on a TV if the change touches the engine, embedder or a plugin's native code.")
+          pr=$(gh pr list --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --title "Merge upstream ${UPSTREAM_REPO}@${UPSTREAM_SHA}" --body "$body"
+            echo "Updated PR #$pr"
+          else
+            gh pr create --base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --label "$LABEL" \
+              --title "Merge upstream ${UPSTREAM_REPO}@${UPSTREAM_SHA}" --body "$body"
+          fi
+
+      - name: Report conflicts
+        if: steps.merge.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+          UPSTREAM_SHA: ${{ steps.fetch.outputs.upstream_sha }}
+        run: |
+          files=$(sed 's/^/- `/; s/$/`/' /tmp/conflicts.txt)
+          body=$(printf '%s\n\n%s\n\n%s\n\n```sh\n%s\n```\n' \
+            "Merging ${BEHIND} new commit(s) from [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) (\`${UPSTREAM_SHA}\`) conflicts in:" \
+            "$files" "Merge by hand:" \
+            "git fetch upstream && git checkout -b upstream-sync-manual origin/${BASE_BRANCH}
+          git merge upstream/${UPSTREAM_BRANCH}   # resolve, build, test
+          git push -u origin upstream-sync-manual  # then open a pull request")
+          issue=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+            echo "Commented on issue #$issue"
+          else
+            gh issue create --label "$LABEL" --title "Upstream merge conflicts (${UPSTREAM_REPO}@${UPSTREAM_SHA})" --body "$body"
+          fi
