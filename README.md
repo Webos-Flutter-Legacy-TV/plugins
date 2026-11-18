@@ -17,12 +17,16 @@ Use a plugin from here with a git dependency:
 
 ```yaml
 dependencies:
-  video_player_webos:
+  video_player: ^2.9.0          # the plugin your Dart code imports
+  video_player_webos:           # its webOS implementation, from this repository
     git:
       url: https://github.com/Webos-Flutter-Legacy-TV/plugins.git
-      ref: main
+      ref: legacy-v0.1.0        # or main for the latest fixes
       path: packages/video_player
 ```
+
+The webOS plugins are not endorsed implementations, so list both. Package
+and folder names are in [doc/plugin-list.md](doc/plugin-list.md).
 
 The other plugins are LG's, unchanged. Which plugins work on which webOS release
 is on the [compatibility page](https://webos-flutter-legacy-tv.github.io/compatibility.html).
