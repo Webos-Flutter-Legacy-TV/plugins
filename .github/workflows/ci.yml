@@ -37,6 +37,9 @@ jobs:
           cache: true
       - name: Analyze
         run: |
+          # webos/flutter/main.dart is the generated webOS runner (LG commits it
+          # for the examples); it imports a file that only a webOS build creates.
+          find packages -type d -path '*/webos/flutter' -prune -exec rm -rf {} +
           status=0
           for pkg in $(find packages -name pubspec.yaml -not -path '*/.dart_tool/*' | sort | xargs -n1 dirname); do
             echo "::group::$pkg"
