@@ -35,6 +35,17 @@ class _VideoWidgetState extends State<_VideoWidget> {
   }
 
   @override
+  void dispose() {
+    // A layout change (e.g. full screen -> small box) replaces this state
+    // with a new one for the same texture. Without this, the old state keeps
+    // re-registering its post-frame callback forever, and a running move
+    // timer can place the video at the old rect after the new state did.
+    _resetRect(false);
+    widget.player.removeWidgetState(widget.textureId, this);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     bool ready = widget.player.isReady(widget.textureId);
     if (!ready) {
@@ -48,6 +59,9 @@ class _VideoWidgetState extends State<_VideoWidget> {
   }
 
   void _afterFrameLayout(_) {
+    if (!mounted) {
+      return;
+    }
     bool ready = widget.player.isReady(widget.textureId);
     final box = _videoBoxKey.currentContext?.findRenderObject() as RenderBox?;
     if (box != null) {
@@ -463,6 +477,13 @@ class VideoPlayerWebOs extends VideoPlayerPlatform {
   //-----------------------------------------------------------------//
   void addWidgetState(int texId, _VideoWidgetState state) {
     _widgetStates[texId] = state;
+  }
+
+  void removeWidgetState(int texId, _VideoWidgetState state) {
+    // Only if not already replaced by the state of a newer widget.
+    if (identical(_widgetStates[texId], state)) {
+      _widgetStates.remove(texId);
+    }
   }
 
   Future<void> viewRect(int texId, double x, double y, double w, double h) {

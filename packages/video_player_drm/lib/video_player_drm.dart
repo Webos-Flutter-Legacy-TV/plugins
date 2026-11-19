@@ -33,6 +33,18 @@ class _VideoWidgetState extends State<_VideoWidget> {
   }
 
   @override
+  void dispose() {
+    // See video_player_webos: stop the post-frame callback chain and any
+    // move timer of a replaced state, so it cannot place the video at a
+    // stale rect.
+    _resetRect(false);
+    if (identical(_widgetStates[widget], this)) {
+      _widgetStates.remove(widget);
+    }
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     bool ready = _pipelines.containsKey(widget.textureId);
     if (!ready) {
@@ -55,6 +67,9 @@ class _VideoWidgetState extends State<_VideoWidget> {
   }
 
   void _afterFrameLayout(_) {
+    if (!mounted) {
+      return;
+    }
     bool ready = _pipelines.containsKey(widget.textureId);
     final box = _videoBoxKey.currentContext?.findRenderObject() as RenderBox?;
     if (box != null) {
