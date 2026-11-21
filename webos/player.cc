@@ -63,6 +63,7 @@ const char* AudioCodecName(AVCodecID id) {
   switch (id) {
     case AV_CODEC_ID_AC3: return "AC3";
     case AV_CODEC_ID_EAC3: return "AC3 PLUS";
+    case AV_CODEC_ID_AAC: return "AAC";
     default: return nullptr;
   }
 }
@@ -217,6 +218,27 @@ std::string HdrInfoPayload(const AVCodecParameters* par, const HevcHdrSei* strea
          (par->color_range == AVCOL_RANGE_JPEG ? "true" : "false") + "}}";
 }
 
+// 7-byte ADTS header for one raw AAC frame of `payload` bytes, from the AudioSpecificConfig in
+// `asc` (MP4/MKV extradata). LG's pipeline takes AAC framed this way (as webos-native-app-kit feeds
+// it). HE-AAC is signalled as its AAC-LC core, which is how ADTS carries it.
+bool AdtsHeader(const uint8_t* asc, int asc_size, int payload, uint8_t out[7]) {
+  if (asc_size < 2) return false;
+  int aot = asc[0] >> 3;
+  int sf = ((asc[0] & 7) << 1) | (asc[1] >> 7);
+  int ch = (asc[1] >> 3) & 0xF;
+  if (aot == 5 || aot == 29 || aot > 4 || aot < 1) aot = 2;
+  if (sf > 12) return false;
+  int len = payload + 7;
+  out[0] = 0xFF;
+  out[1] = 0xF1;  // MPEG-4, layer 0, no CRC
+  out[2] = static_cast<uint8_t>(((aot - 1) << 6) | (sf << 2) | (ch >> 2));
+  out[3] = static_cast<uint8_t>(((ch & 3) << 6) | (len >> 11));
+  out[4] = static_cast<uint8_t>((len >> 3) & 0xFF);
+  out[5] = static_cast<uint8_t>(((len & 7) << 5) | 0x1F);
+  out[6] = 0xFC;
+  return true;
+}
+
 }  // namespace
 
 struct Player::Media {
@@ -248,6 +270,7 @@ struct Player::Media {
   bool own_annexb = false;
   std::unique_ptr<AudioTranscoder> transcoder;  // set when the audio is re-encoded to AC-3
   int64_t dumped_bytes = 0;
+  std::vector<uint8_t> aac;     // an ADTS-framed AAC frame
   int nal_length_size = 4;
   std::vector<uint8_t> params;  // VPS/SPS/PPS (or SPS/PPS) with start codes, for keyframes
   std::vector<uint8_t> conv;
@@ -488,6 +511,23 @@ bool Player::LoadPipeline() {
              m.audio_channels + (m.atmos ? 2 : 0), m.audio_rate / 1000.0);
     dv += info;
     if (m.atmos) dv += ",\"immersive\":\"ATMOS\"";
+  }
+  // AAC: what Kodi declares (channels, profile = object type, framing, rate in kHz); without it the
+  // pipeline reports no sample rate. We feed ADTS frames.
+  if (m.audio_codec && std::strcmp(m.audio_codec, "AAC") == 0 && m.audio_channels > 0) {
+    const AVCodecParameters* ap = m.format->streams[m.audio]->codecpar;
+    int rate = m.audio_rate;
+    int aot = ap->profile >= 0 ? ap->profile + 1 : 2;
+    if (ap->extradata_size >= 2) {
+      static const int kRates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+      int sf = ((ap->extradata[0] & 7) << 1) | (ap->extradata[1] >> 7);
+      if (sf < 13) rate = kRates[sf];
+      aot = ap->extradata[0] >> 3;
+    }
+    char info[128];
+    snprintf(info, sizeof info, ",\"aacInfo\":{\"channels\":%d,\"profile\":%d,\"format\":\"adts\",\"frequency\":%g}",
+             m.audio_channels, aot, rate / 1000.0);
+    dv += info;
   }
   // Kodi's transmission and seek keys; corrupted / dropped frames are reported back (logged).
   std::string live = m.knobs.live ? ",\"transmission\":{\"contentsType\":\"LIVE\",\"trickType\":\"client-side\"}" : "";
@@ -770,7 +810,17 @@ void Player::FeedLoop() {
         FeedPacket(data, size, ns - m.start_us * 1000 - pts_shift_ns_, 2);
       });
     } else if (packet->stream_index == m.audio) {
-      FeedPacket(packet->data, packet->size, pts_ns - pts_shift_ns_, 2);
+      const AVCodecParameters* ap = st->codecpar;
+      bool framed = packet->size >= 2 && packet->data[0] == 0xFF && (packet->data[1] & 0xF0) == 0xF0;
+      uint8_t adts[7];
+      if (ap->codec_id == AV_CODEC_ID_AAC && !framed &&
+          AdtsHeader(ap->extradata, ap->extradata_size, packet->size, adts)) {
+        m.aac.assign(adts, adts + 7);
+        m.aac.insert(m.aac.end(), packet->data, packet->data + packet->size);
+        FeedPacket(m.aac.data(), static_cast<int>(m.aac.size()), pts_ns - pts_shift_ns_, 2);
+      } else {
+        FeedPacket(packet->data, packet->size, pts_ns - pts_shift_ns_, 2);
+      }
       release(packet);
     }
     av_packet_unref(packet);

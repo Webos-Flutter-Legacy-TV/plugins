@@ -14,7 +14,8 @@ Tested on an LG C1 (webOS 6.5.3):
 
 - Video: H.264 and HEVC, 4K HDR10 and Dolby Vision profiles 5 / 8 (`DolbyHdrInfo` in the Load
   payload; profile 7 plays its HDR10 base). Checked visually against the TV's own player.
-- Audio: AC-3 and E-AC-3 as they are, Atmos flagged (`ac3PlusInfo`, `immersive`). Everything else
+- Audio: AC-3 and E-AC-3 as they are, Atmos flagged (`ac3PlusInfo`, `immersive`); AAC as ADTS frames
+  with `aacInfo` (as Kodi declares it). Everything else
   FFmpeg decodes (DTS core, TrueHD/MLP, FLAC, Opus, Vorbis, MP3, PCM) is decoded on the TV and
   re-encoded to E-AC-3 5.1 / stereo at 640 kb/s (`audio_transcode.cc`); 7.1 is folded to 5.1.
   E-AC-3 rather than AC-3: AC-3 fed this way sounded muffled on the C1 (the pipeline reported no
@@ -38,7 +39,7 @@ Test knobs: key=value lines in the app's `/tmp/webos_native_player.conf` change 
 details at the next open (see `Knobs` in `player.cc`); every pipeline callback is logged to the
 app's `compat.log` (`[native-player]` lines).
 
-Planned: AAC, in-file audio and subtitle tracks, PGS, DTS fed as is where the TV decodes it
+Planned: in-file audio and subtitle tracks, PGS, DTS fed as is where the TV decodes it
 (`dts_restore`), profile 7 to 8.1.
 
 ## Layout
