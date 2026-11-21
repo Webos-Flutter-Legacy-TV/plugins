@@ -75,6 +75,18 @@ class PathProviderWebOS extends PathProviderPlatform {
     return directory.path;
   }
 
+  /// The app's cache folder: FLUTTER_TEMP_HOME (by default `<app>/appdata/.cache`,
+  /// kept between starts) plus the app id. Without this the platform interface
+  /// throws UnimplementedError, which apps tend to catch and treat as "no cache".
+  @override
+  Future<String?> getApplicationCachePath() async {
+    final Directory directory = Directory(
+      path.join(tmpHome.path, await _getId()),
+    );
+    await directory.create(recursive: true);
+    return directory.path;
+  }
+
   @override
   Future<String?> getApplicationSupportPath() async {
     final Directory directory = Directory(

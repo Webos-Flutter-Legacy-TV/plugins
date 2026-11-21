@@ -1,6 +1,6 @@
 name: path_provider_webos
 description: webos implementation of the path_provider plugin
-version: 1.0.0
+version: 1.0.1
 
 environment:
   sdk: '>=2.19.4 <4.0.0'

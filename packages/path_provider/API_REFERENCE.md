@@ -18,6 +18,7 @@ This plugin provides the webOS platform implementation of `path_provider`. Users
 | API | Supported | Notes |
 |-----|-----------|-------|
 | `getTemporaryDirectory()` | Yes | `FLUTTER_TEMP_HOME` or `$FLUTTER_HOME/.cache` |
+| `getApplicationCacheDirectory()` | Yes (1.0.1) | `FLUTTER_TEMP_HOME` or `$FLUTTER_HOME/.cache`, kept between starts |
 | `getApplicationSupportDirectory()` | Yes | `FLUTTER_APPDATA_HOME` or `$FLUTTER_HOME/.data` |
 | `getApplicationDocumentsDirectory()` | Yes | `FLUTTER_APPDATA_HOME` or `$FLUTTER_HOME/.data` |
 | `getDownloadsDirectory()` | Yes | `FLUTTER_DOWNLOAD_HOME` or `$FLUTTER_HOME/.download` |
