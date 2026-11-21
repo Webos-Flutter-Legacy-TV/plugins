@@ -18,6 +18,7 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 }
 
+#include "audio_transcode.h"
 #include "hevc_sei.h"
 #include "starfish.h"
 
@@ -92,6 +93,10 @@ struct Knobs {
   bool live = true;            // send transmission.contentsType LIVE
   bool strip_hdr10plus = true; // remove HDR10+ SEI from HEVC before feeding
   bool own_annexb = true;      // own length-prefixed -> Annex B conversion (else ffmpeg's filter)
+  bool audio_transcode = true; // decode audio the TV cannot (DTS, TrueHD, ...) and feed AC-3
+  int ac3_bitrate = 640000;
+  bool eac3 = true;            // re-encode to E-AC-3 (declared with ac3PlusInfo) rather than AC-3
+  bool dump_audio = false;     // write the first 20 s of re-encoded audio to /tmp/wnp-audio.ac3
   bool hdr_info = true;        // setHdrInfo after Load (HDR10 / HLG colour description)
 };
 
@@ -117,6 +122,10 @@ Knobs ReadKnobs() {
     else if (k2 == "strip_hdr10plus") k.strip_hdr10plus = v != 0;
     else if (k2 == "hdr_info") k.hdr_info = v != 0;
     else if (k2 == "own_annexb") k.own_annexb = v != 0;
+    else if (k2 == "audio_transcode") k.audio_transcode = v != 0;
+    else if (k2 == "ac3_bitrate") k.ac3_bitrate = static_cast<int>(v);
+    else if (k2 == "dump_audio") k.dump_audio = v != 0;
+    else if (k2 == "eac3") k.eac3 = v != 0;
   }
   fclose(f);
   LOG("knobs: pts_nudge_ns=%lld separated_pts=%d low_delay=%d max_frame_rate=%d declare_dv=%d drop_rpu=%d hold_packets=%d adaptive=%d live=%d strip_hdr10plus=%d hdr_info=%d own_annexb=%d",
@@ -237,6 +246,8 @@ struct Player::Media {
   int64_t first_fed_ns = -1;
   int logged_aus = 0;
   bool own_annexb = false;
+  std::unique_ptr<AudioTranscoder> transcoder;  // set when the audio is re-encoded to AC-3
+  int64_t dumped_bytes = 0;
   int nal_length_size = 4;
   std::vector<uint8_t> params;  // VPS/SPS/PPS (or SPS/PPS) with start codes, for keyframes
   std::vector<uint8_t> conv;
@@ -371,9 +382,25 @@ bool Player::Open() {
       m.audio_channels = ap->ch_layout.nb_channels;
       m.audio_rate = ap->sample_rate;
       m.atmos = ap->codec_id == AV_CODEC_ID_EAC3 && ap->profile == AV_PROFILE_EAC3_DDP_ATMOS;
+    } else if (m.knobs.audio_transcode) {
+      // The TV cannot decode this one: decode it here and feed AC-3.
+      auto t = std::make_unique<AudioTranscoder>();
+      std::string error;
+      if (t->Open(m.format->streams[a]->codecpar, m.knobs.ac3_bitrate, m.knobs.eac3, &error)) {
+        LOG("audio re-encoded: %s", t->description().c_str());
+        m.audio = a;
+        // Plain AC-3 fed this way played muffled on the C1 (the pipeline reported no sample
+        // rate for it); E-AC-3 is declared with its rate (ac3PlusInfo) and plays clean.
+        m.audio_codec = m.knobs.eac3 ? "AC3 PLUS" : "AC3";
+        m.audio_channels = t->channels();
+        m.audio_rate = t->sample_rate();
+        m.transcoder = std::move(t);
+      } else {
+        LOG("audio %s cannot be re-encoded (%s): playing without sound",
+            avcodec_get_name(m.format->streams[a]->codecpar->codec_id), error.c_str());
+      }
     } else {
-      LOG("audio %s not fed yet: playing without sound",
-          avcodec_get_name(m.format->streams[a]->codecpar->codec_id));
+      LOG("audio %s not fed: playing without sound", avcodec_get_name(m.format->streams[a]->codecpar->codec_id));
     }
   }
   for (unsigned i = 0; i < m.format->nb_streams; i++) {
@@ -576,6 +603,7 @@ void Player::FeedLoop() {
       av_bsf_flush(m.annexb);
       m.anchor_pending = true;
       m.fresh_start = false;
+      if (m.transcoder) m.transcoder->Flush();
       eos = false;
     }
 
@@ -730,6 +758,17 @@ void Player::FeedLoop() {
           release(out);
         }
       }
+    } else if (packet->stream_index == m.audio && m.transcoder) {
+      m.transcoder->Push(packet, st->time_base, [&](const uint8_t* data, int size, int64_t ns) {
+        if (m.knobs.dump_audio && m.dumped_bytes < 20 * 80000) {
+          if (FILE* f = fopen("/tmp/wnp-audio.ac3", m.dumped_bytes == 0 ? "wb" : "ab")) {
+            fwrite(data, 1, size, f);
+            fclose(f);
+          }
+          m.dumped_bytes += size;
+        }
+        FeedPacket(data, size, ns - m.start_us * 1000 - pts_shift_ns_, 2);
+      });
     } else if (packet->stream_index == m.audio) {
       FeedPacket(packet->data, packet->size, pts_ns - pts_shift_ns_, 2);
       release(packet);
