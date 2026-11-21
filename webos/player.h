@@ -55,6 +55,11 @@ class Player {
   std::atomic<bool> paused_{false};
   std::atomic<int64_t> seek_request_ms_{-1};
   std::atomic<int64_t> last_fed_video_ns_{0};
+  std::atomic<int64_t> position_ns_{0};
+  int64_t feed_error_retries_ = 0;
+  // Subtracted from fed PTS: a start part-way in feeds from 0 (the pipeline's segment starts at 0 and
+  // refuses Seek before it plays); after a Seek the pipeline runs on content time and this is 0.
+  std::atomic<int64_t> pts_shift_ns_{0};  // from the pipeline's frame-ready event (type 0, ~5 Hz)
   std::atomic<bool> loaded_{false};
   std::atomic<bool> unloaded_{false};
   std::mutex mutex_;  // guards pipeline_ between the feed thread and Play/Pause from Dart

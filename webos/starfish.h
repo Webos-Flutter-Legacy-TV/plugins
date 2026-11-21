@@ -29,6 +29,9 @@ class StarfishMediaAPIs {
   bool pushEOS();
   bool SetPlayRate(const char* rate);
   bool setVolume(const char* json);
+  // webOS 5+: the stream's HDR description before the first picture:
+  // {"hdrType":"HDR10","sei":{...},"vui":{...}} (SEI units as in CTA-861.3).
+  bool setHdrInfo(const char* json);
   void notifyForeground();
   bool isLoadCompleted();
   long long getCurrentPlaytime();

@@ -12,6 +12,7 @@ bool StarfishMediaAPIs::Seek(const char*) { return false; }
 bool StarfishMediaAPIs::pushEOS() { return false; }
 bool StarfishMediaAPIs::SetPlayRate(const char*) { return false; }
 bool StarfishMediaAPIs::setVolume(const char*) { return false; }
+bool StarfishMediaAPIs::setHdrInfo(const char*) { return false; }
 void StarfishMediaAPIs::notifyForeground() {}
 bool StarfishMediaAPIs::isLoadCompleted() { return false; }
 long long StarfishMediaAPIs::getCurrentPlaytime() { return 0; }

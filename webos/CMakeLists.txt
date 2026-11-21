@@ -22,6 +22,7 @@ set_target_properties(playerAPIs_stub PROPERTIES
 add_library(${PLUGIN_NAME} SHARED
   "plugin.cc"
   "player.cc"
+  "hevc_sei.cc"
 )
 apply_standard_settings(${PLUGIN_NAME})
 set_target_properties(${PLUGIN_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)

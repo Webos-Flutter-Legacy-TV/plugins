@@ -77,11 +77,6 @@ class NativePlayerController extends ValueNotifier<NativePlayerValue> {
   Future<void> initialize() async {
     final ready = Completer<void>();
     _windowId = await _windows.invokeMethod<String>('create', {});
-    await _windows.invokeMethod<void>('resize', {
-      'windowId': _windowId,
-      'srcRect': [0, 0, 1920, 1080],
-      'dstRect': [0, 0, 1920, 1080],
-    });
     _id = await _channel.invokeMethod<int>('open', {
       'url': url,
       'windowId': _windowId,
@@ -101,6 +96,9 @@ class NativePlayerController extends ValueNotifier<NativePlayerValue> {
             videoCodec: e['videoCodec'],
             audioCodec: e['audioCodec'],
           );
+          // The window's source rect must be the video's real size (3840x2160 for 4K): a smaller
+          // one makes the TV's scaler treat the picture as a crop of it (colour faults in 4K).
+          _placeWindow(value.size);
           if (!ready.isCompleted) ready.complete();
         case 'completed':
           value = value.copyWith(completed: true, playing: false);
@@ -115,6 +113,26 @@ class NativePlayerController extends ValueNotifier<NativePlayerValue> {
     });
     _positionTimer = Timer.periodic(const Duration(milliseconds: 250), (_) => _pollPosition());
     return ready.future;
+  }
+
+  Future<void> _placeWindow(Size video) async {
+    final win = _windowId;
+    if (win == null || video.width <= 0 || video.height <= 0 || _disposed) return;
+    final rects = {
+      'windowId': win,
+      'srcRect': [0, 0, video.width.toInt(), video.height.toInt()],
+      'dstRect': [0, 0, 1920, 1080],
+    };
+    // setExportedWindow places the plane with the compositor's set_exported_window (source and
+    // destination), as LG's SDL does for native apps; 'resize' uses set_crop_region, which leaves
+    // 4K buffer-fed video with a colour seam across the middle on webOS 6.
+    try {
+      await _windows.invokeMethod<void>('setExportedWindow', rects);
+      debugPrint('webos_native_player: placed with setExportedWindow');
+    } on Object catch (e) {
+      debugPrint('webos_native_player: setExportedWindow failed ($e); using resize');
+      await _windows.invokeMethod<void>('resize', rects);
+    }
   }
 
   Future<void> _pollPosition() async {

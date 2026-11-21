@@ -3,16 +3,22 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
+#include <libavutil/dovi_meta.h>
+#include <libavutil/mastering_display_metadata.h>
 }
 
+#include "hevc_sei.h"
 #include "starfish.h"
 
 #define LOG(...)                                \
@@ -60,6 +66,148 @@ const char* AudioCodecName(AVCodecID id) {
   }
 }
 
+// First coded picture's NAL type in an HEVC Annex B access unit (-1 if none): 19/20 are IDR.
+int HevcFirstVclType(const uint8_t* d, int n) {
+  for (int i = 0; i + 3 < n; i++) {
+    if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+      int type = (d[i + 3] >> 1) & 0x3f;
+      if (type < 32) return type;
+      i += 2;
+    }
+  }
+  return -1;
+}
+
+// Test knobs: key=value lines in /tmp/webos_native_player.conf (the app's own /tmp), read at each
+// open. Lets one build try variations on the TV. Unknown keys are ignored.
+struct Knobs {
+  int64_t pts_nudge_ns = -1;   // added to every fed video PTS (Dolby Vision frame lattice)
+  bool separated_pts = true;   // esInfo.seperatedPTS
+  bool low_delay = false;      // lowDelayMode
+  int max_frame_rate = 60;     // adaptiveStreaming.maxFrameRate
+  bool declare_dv = true;      // send DolbyHdrInfo for profiles 5 / 8
+  bool drop_rpu = false;       // drop Dolby Vision RPU NAL units (type 62) before feeding
+  int hold_packets = 0;        // keep the last N fed packets alive (does Feed read later?)
+  bool adaptive = true;        // send the adaptiveStreaming block (max size / rate envelope)
+  bool live = true;            // send transmission.contentsType LIVE
+  bool strip_hdr10plus = true; // remove HDR10+ SEI from HEVC before feeding
+  bool own_annexb = true;      // own length-prefixed -> Annex B conversion (else ffmpeg's filter)
+  bool hdr_info = true;        // setHdrInfo after Load (HDR10 / HLG colour description)
+};
+
+Knobs ReadKnobs() {
+  Knobs k;
+  FILE* f = fopen("/tmp/webos_native_player.conf", "r");
+  if (!f) return k;
+  char line[256];
+  while (fgets(line, sizeof line, f)) {
+    char key[64];
+    long long v;
+    if (sscanf(line, "%63[^=]=%lld", key, &v) != 2) continue;
+    std::string k2 = key;
+    if (k2 == "pts_nudge_ns") k.pts_nudge_ns = v;
+    else if (k2 == "separated_pts") k.separated_pts = v != 0;
+    else if (k2 == "low_delay") k.low_delay = v != 0;
+    else if (k2 == "max_frame_rate") k.max_frame_rate = static_cast<int>(v);
+    else if (k2 == "declare_dv") k.declare_dv = v != 0;
+    else if (k2 == "drop_rpu") k.drop_rpu = v != 0;
+    else if (k2 == "hold_packets") k.hold_packets = static_cast<int>(v);
+    else if (k2 == "adaptive") k.adaptive = v != 0;
+    else if (k2 == "live") k.live = v != 0;
+    else if (k2 == "strip_hdr10plus") k.strip_hdr10plus = v != 0;
+    else if (k2 == "hdr_info") k.hdr_info = v != 0;
+    else if (k2 == "own_annexb") k.own_annexb = v != 0;
+  }
+  fclose(f);
+  LOG("knobs: pts_nudge_ns=%lld separated_pts=%d low_delay=%d max_frame_rate=%d declare_dv=%d drop_rpu=%d hold_packets=%d adaptive=%d live=%d strip_hdr10plus=%d hdr_info=%d own_annexb=%d",
+      static_cast<long long>(k.pts_nudge_ns), k.separated_pts, k.low_delay, k.max_frame_rate, k.declare_dv, k.drop_rpu, k.hold_packets, k.adaptive, k.live, k.strip_hdr10plus, k.hdr_info, k.own_annexb);
+  return k;
+}
+
+// Removes HEVC NAL units of one type from an Annex B buffer (in place); returns the new size.
+int StripNalType(uint8_t* d, int n, int drop_type) {
+  int out = 0, i = 0;
+  auto next_start = [&](int from) {
+    for (int j = from; j + 2 < n; j++)
+      if (d[j] == 0 && d[j + 1] == 0 && d[j + 2] == 1) return j;
+    return n;
+  };
+  int start = next_start(0);
+  while (start < n) {
+    int payload = start + 3;
+    int end = next_start(payload);
+    int nal_end = end;
+    if (end < n && end > payload && d[end - 1] == 0) nal_end = end - 1;  // 4-byte start code
+    int type = payload < n ? (d[payload] >> 1) & 0x3f : -1;
+    int from = (start > 0 && d[start - 1] == 0) ? start - 1 : start;
+    if (type != drop_type) {
+      memmove(d + out, d + from, nal_end - from);
+      out += nal_end - from;
+    }
+    start = end;
+    (void)i;
+  }
+  return out;
+}
+
+// setHdrInfo payload from the container's colour description (as Kodi and webos-native-app-kit send
+// it): hdrType, the mastering display / light level SEI values (primaries G, B, R in 1/50000,
+// luminance in 1/10000 cd/m2) and the VUI codes. Empty for SDR or when the container states no
+// mastering data (some TVs crash on an HDR message without it).
+std::string HdrInfoPayload(const AVCodecParameters* par, const HevcHdrSei* stream_sei) {
+  const char* type = par->color_trc == AVCOL_TRC_SMPTE2084 ? "HDR10" : par->color_trc == AVCOL_TRC_ARIB_STD_B67 ? "HLG" : nullptr;
+  if (!type) return "";
+  std::string sei;
+  auto add = [&sei](const char* key, long long v) {
+    sei += std::string(sei.empty() ? "" : ",") + "\"" + key + "\":" + std::to_string(v);
+  };
+  if (const AVPacketSideData* sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
+                                                           AV_PKT_DATA_MASTERING_DISPLAY_METADATA)) {
+    auto* md = reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data);
+    if (md->has_primaries) {
+      const int order[3] = {1, 2, 0};  // G, B, R
+      for (int i = 0; i < 3; i++) {
+        add(("displayPrimariesX" + std::to_string(i)).c_str(), llround(av_q2d(md->display_primaries[order[i]][0]) * 50000));
+        add(("displayPrimariesY" + std::to_string(i)).c_str(), llround(av_q2d(md->display_primaries[order[i]][1]) * 50000));
+      }
+      add("whitePointX", llround(av_q2d(md->white_point[0]) * 50000));
+      add("whitePointY", llround(av_q2d(md->white_point[1]) * 50000));
+    }
+    if (md->has_luminance) {
+      add("minDisplayMasteringLuminance", llround(av_q2d(md->min_luminance) * 10000));
+      add("maxDisplayMasteringLuminance", llround(av_q2d(md->max_luminance) * 10000));
+    }
+  }
+  if (const AVPacketSideData* sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
+                                                           AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
+    auto* cll = reinterpret_cast<const AVContentLightMetadata*>(sd->data);
+    add("maxContentLightLevel", cll->MaxCLL);
+    add("maxPicAverageLightLevel", cll->MaxFALL);
+  }
+  if (sei.empty() && stream_sei) {
+    // Not in the container: the values the video stream's own SEI carries (same units).
+    if (stream_sei->has_mastering) {
+      for (int i = 0; i < 3; i++) {
+        add(("displayPrimariesX" + std::to_string(i)).c_str(), stream_sei->primaries[i][0]);
+        add(("displayPrimariesY" + std::to_string(i)).c_str(), stream_sei->primaries[i][1]);
+      }
+      add("whitePointX", stream_sei->white[0]);
+      add("whitePointY", stream_sei->white[1]);
+      add("minDisplayMasteringLuminance", stream_sei->min_luminance);
+      add("maxDisplayMasteringLuminance", stream_sei->max_luminance);
+    }
+    if (stream_sei->has_light_level) {
+      add("maxContentLightLevel", stream_sei->max_cll);
+      add("maxPicAverageLightLevel", stream_sei->max_fall);
+    }
+  }
+  if (sei.empty()) return "";
+  return std::string("{\"hdrType\":\"") + type + "\",\"sei\":{" + sei + "},\"vui\":{\"transferCharacteristics\":" +
+         std::to_string(par->color_trc) + ",\"colorPrimaries\":" + std::to_string(par->color_primaries) +
+         ",\"matrixCoeffs\":" + std::to_string(par->color_space) + ",\"videoFullRangeFlag\":" +
+         (par->color_range == AVCOL_RANGE_JPEG ? "true" : "false") + "}}";
+}
+
 }  // namespace
 
 struct Player::Media {
@@ -73,7 +221,28 @@ struct Player::Media {
   int height = 0;
   int64_t start_us = 0;  // the container's first timestamp; fed PTS start at 0
   int64_t duration_ms = 0;
+  AVRational frame_rate{0, 1};  // the video's average frame rate (24000/1001, 24/1, ...)
+  int audio_channels = 0;
+  int audio_rate = 0;
+  bool atmos = false;
+  int dv_profile = 0;    // Dolby Vision profile from the file's configuration record (0: none)
+  bool dv_declared = false;  // told to the pipeline (profiles 5 and 8)
   bool anchor_pending = false;  // after a seek: drop until the landing keyframe, then Seek() there
+  bool fresh_start = true;      // nothing fed yet and starting at 0: no Seek() needed
+  bool initial_start = true;    // the first anchor of the session (no Seek possible yet)
+  Knobs knobs;
+  bool is_hevc = false;
+  std::string hdr_info;         // setHdrInfo payload, empty when SDR or unknown
+  bool started = false;         // Play() called once about a second is fed
+  int64_t first_fed_ns = -1;
+  int logged_aus = 0;
+  bool own_annexb = false;
+  int nal_length_size = 4;
+  std::vector<uint8_t> params;  // VPS/SPS/PPS (or SPS/PPS) with start codes, for keyframes
+  std::vector<uint8_t> conv;
+  std::chrono::steady_clock::time_point last_lead_log{};
+  std::vector<uint8_t> au;      // a rewritten access unit
+  int64_t hdr10plus_stripped = 0;
 
   ~Media() {
     if (annexb) av_bsf_free(&annexb);
@@ -110,10 +279,9 @@ void Player::Pause() {
 void Player::SeekTo(int64_t ms) { seek_request_ms_ = std::max<int64_t>(0, ms); }
 
 int64_t Player::PositionMs() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!pipeline_ || !loaded_) return 0;
-  // Nanoseconds of the fed timeline.
-  return pipeline_->getCurrentPlaytime() / 1000000;
+  // getCurrentPlaytime() stays 0 in buffer-feed mode (webOS 6.5.3); the frame-ready event carries
+  // the presented PTS in nanoseconds of the fed timeline.
+  return (position_ns_ + pts_shift_ns_) / 1000000;
 }
 
 void Player::Run() {
@@ -143,6 +311,7 @@ void Player::Run() {
 
 bool Player::Open() {
   Media& m = *media_;
+  m.knobs = ReadKnobs();
   m.format = avformat_alloc_context();
   m.format->interrupt_callback.callback = Interrupted;
   m.format->interrupt_callback.opaque = &stop_;
@@ -176,6 +345,18 @@ bool Player::Open() {
   }
   m.width = vs->codecpar->width;
   m.height = vs->codecpar->height;
+  m.is_hevc = vs->codecpar->codec_id == AV_CODEC_ID_HEVC;
+  m.hdr_info = HdrInfoPayload(vs->codecpar, nullptr);
+  m.frame_rate = vs->avg_frame_rate.num > 0 ? vs->avg_frame_rate : vs->r_frame_rate;
+  if (const AVPacketSideData* sd = av_packet_side_data_get(vs->codecpar->coded_side_data,
+                                                           vs->codecpar->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF)) {
+    auto* dovi = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data);
+    m.dv_profile = dovi->dv_profile;
+    // Profile 7 (dual layer) is not decoded as Dolby Vision by LG TVs: its HDR10 base plays.
+    m.dv_declared = m.knobs.declare_dv && (m.dv_profile == 5 || m.dv_profile == 8);
+    LOG("dolby vision profile %d level %d bl_compat %d el %d -> %s", dovi->dv_profile, dovi->dv_level,
+        dovi->dv_bl_signal_compatibility_id, dovi->el_present_flag, m.dv_declared ? "declared" : "base layer");
+  }
 
   int a = options_.audio_stream;
   if (a < 0 || a >= static_cast<int>(m.format->nb_streams) ||
@@ -186,6 +367,10 @@ bool Player::Open() {
     m.audio_codec = AudioCodecName(m.format->streams[a]->codecpar->codec_id);
     if (m.audio_codec) {
       m.audio = a;
+      const AVCodecParameters* ap = m.format->streams[a]->codecpar;
+      m.audio_channels = ap->ch_layout.nb_channels;
+      m.audio_rate = ap->sample_rate;
+      m.atmos = ap->codec_id == AV_CODEC_ID_EAC3 && ap->profile == AV_PROFILE_EAC3_DDP_ATMOS;
     } else {
       LOG("audio %s not fed yet: playing without sound",
           avcodec_get_name(m.format->streams[a]->codecpar->codec_id));
@@ -210,6 +395,34 @@ bool Player::Open() {
     return false;
   }
 
+  if (m.hdr_info.empty() && m.is_hevc &&
+      (vs->codecpar->color_trc == AVCOL_TRC_SMPTE2084 || vs->codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67)) {
+    // The container has no mastering data: read the first keyframe's SEI, then rewind.
+    AVPacket* pkt = av_packet_alloc();
+    AVPacket* o = av_packet_alloc();
+    HevcHdrSei sei;
+    bool found = false;
+    for (int tries = 0; tries < 200 && !found && av_read_frame(m.format, pkt) >= 0; tries++) {
+      if (pkt->stream_index == m.video && (pkt->flags & AV_PKT_FLAG_KEY) && av_bsf_send_packet(m.annexb, pkt) == 0) {
+        while (av_bsf_receive_packet(m.annexb, o) == 0) {
+          found = found || HevcFindHdrSei(o->data, o->size, &sei);
+          av_packet_unref(o);
+        }
+        break;
+      }
+      av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    av_packet_free(&o);
+    av_bsf_flush(m.annexb);
+    av_seek_frame(m.format, -1, m.format->start_time != AV_NOPTS_VALUE ? m.format->start_time : 0, AVSEEK_FLAG_BACKWARD);
+    if (found) m.hdr_info = HdrInfoPayload(vs->codecpar, &sei);
+  }
+  m.own_annexb = m.knobs.own_annexb &&
+                 ParameterSetsFromRecord(vs->codecpar->extradata, vs->codecpar->extradata_size, m.is_hevc,
+                                         &m.params, &m.nal_length_size);
+  LOG("video conversion: %s (%zu bytes of parameter sets, NAL length %d)",
+      m.own_annexb ? "own" : "ffmpeg filter", m.params.size(), m.nal_length_size);
   m.start_us = m.format->start_time != AV_NOPTS_VALUE ? m.format->start_time : 0;
   m.duration_ms = m.format->duration != AV_NOPTS_VALUE ? m.format->duration / 1000 : 0;
   LOG("opened %s: video #%d %s %dx%d, audio #%d %s, %" PRId64 " ms, start %" PRId64 " us",
@@ -218,33 +431,67 @@ bool Player::Open() {
 
   if (options_.start_ms > 0) {
     av_seek_frame(m.format, -1, m.start_us + options_.start_ms * 1000, AVSEEK_FLAG_BACKWARD);
-    m.anchor_pending = true;
+    m.fresh_start = false;
   }
+  // The first picture fed is anchored like a seek (with Dolby Vision it must be an IDR).
+  m.anchor_pending = true;
   return true;
 }
 
 bool Player::LoadPipeline() {
   Media& m = *media_;
   const char* app_id = getenv("FLUTTER_APP_ID");
-  bool uhd = m.width > 1920 || m.height > 1080 || std::strcmp(m.video_codec, "H265") == 0;
-  char payload[2048];
+  // Dolby Vision: the node's presence switches LG's pipeline to DV caps; profileId is an integer.
+  std::string dv = m.dv_declared
+      ? ",\"DolbyHdrInfo\":{\"trackType\":\"single\",\"encryptionType\":\"clear\",\"profileId\":" +
+            std::to_string(m.dv_profile) + "}"
+      : "";
+  // The video's real frame rate (LG otherwise assumes 60), as webos-native-app-kit declares it.
+  std::string fps;
+  if (m.frame_rate.num > 0 && m.frame_rate.den > 0) {
+    fps = ",\"videoFpsValue\":" + std::to_string(m.frame_rate.num) + ",\"videoFpsScale\":" + std::to_string(m.frame_rate.den);
+  }
+  // The picture's size, as Kodi declares it: the pipeline otherwise sets the decoder up from the
+  // adaptive envelope alone.
+  fps += ",\"videoWidth\":" + std::to_string(m.width) + ",\"videoHeight\":" + std::to_string(m.height);
+  // E-AC-3: its channels (two more for Atmos) and rate in kHz; Atmos flagged for the soundbar.
+  if (m.audio_codec && std::strcmp(m.audio_codec, "AC3 PLUS") == 0 && m.audio_channels > 0 && m.audio_rate > 0) {
+    char info[96];
+    snprintf(info, sizeof info, ",\"ac3PlusInfo\":{\"channels\":%d,\"frequency\":%g}",
+             m.audio_channels + (m.atmos ? 2 : 0), m.audio_rate / 1000.0);
+    dv += info;
+    if (m.atmos) dv += ",\"immersive\":\"ATMOS\"";
+  }
+  // Kodi's transmission and seek keys; corrupted / dropped frames are reported back (logged).
+  std::string live = m.knobs.live ? ",\"transmission\":{\"contentsType\":\"LIVE\",\"trickType\":\"client-side\"}" : "";
+  live += ",\"seekMode\":\"keep-rate\",\"useDroppedFrameEvent\":true";
+  std::string adaptive;
+  {
+    bool big = m.width > 1920 || m.height > 1080 || std::strcmp(m.video_codec, "H265") == 0;
+    if (m.knobs.adaptive) {
+      adaptive = std::string(",\"adaptiveStreaming\":{\"audioOnly\":false") +
+                 (m.frame_rate.num > 0 ? ",\"adaptiveResolution\":true" : "") + ",\"maxWidth\":" + std::to_string(big ? 3840 : 1920) +
+                 ",\"maxHeight\":" + std::to_string(big ? 2160 : 1080) +
+                 ",\"maxFrameRate\":" + std::to_string(m.knobs.max_frame_rate) + "}";
+    }
+  }
+  char payload[4096];
   snprintf(payload, sizeof payload,
            "{\"args\":[{\"mediaTransportType\":\"BUFFERSTREAM\",\"option\":{"
            "\"appId\":\"%s\",\"windowId\":\"%s\","
            "\"externalStreamingInfo\":{\"contents\":{\"codec\":{\"video\":\"%s\"%s%s%s},"
-           "\"esInfo\":{\"pauseAtDecodeTime\":false,\"ptsToDecode\":0,\"seperatedPTS\":true},"
-           "\"format\":\"RAW\",\"provider\":\"webos_native_player\"},"
-           "\"streamQualityInfo\":true,\"audioSync\":true,\"restartStreaming\":false,"
+           "\"esInfo\":{\"pauseAtDecodeTime\":false,\"ptsToDecode\":0,\"seperatedPTS\":%s%s},"
+           "\"format\":\"RAW\",\"provider\":\"webos_native_player\"%s},"
+           "\"streamQualityInfo\":true,\"streamQualityInfoNonFlushable\":true,\"streamQualityInfoCorruptedFrame\":true,\"audioSync\":true,\"restartStreaming\":false,"
            "\"bufferingCtrInfo\":{\"bufferMaxLevel\":0,\"bufferMinLevel\":0,\"preBufferByte\":0,"
            "\"qBufferLevelAudio\":0,\"qBufferLevelVideo\":0,"
            "\"srcBufferLevelAudio\":{\"minimum\":1,\"maximum\":1048576},"
            "\"srcBufferLevelVideo\":{\"minimum\":1,\"maximum\":8388608}}},"
-           "\"needAudio\":%s,\"queryPosition\":false,\"lowDelayMode\":false,"
-           "\"transmission\":{\"contentsType\":\"LIVE\"},"
-           "\"adaptiveStreaming\":{\"audioOnly\":false,\"maxWidth\":%d,\"maxHeight\":%d,\"maxFrameRate\":60}}}]}",
+           "\"needAudio\":%s,\"queryPosition\":false,\"lowDelayMode\":%s%s%s}}]}",
            JsonEscape(app_id ? app_id : "").c_str(), JsonEscape(options_.window_id).c_str(),
            m.video_codec, m.audio_codec ? ",\"audio\":\"" : "", m.audio_codec ? m.audio_codec : "",
-           m.audio_codec ? "\"" : "", m.audio_codec ? "true" : "false", uhd ? 3840 : 1920, uhd ? 2160 : 1080);
+           m.audio_codec ? "\"" : "", m.knobs.separated_pts ? "true" : "false", fps.c_str(), dv.c_str(),
+           m.audio_codec ? "true" : "false", m.knobs.low_delay ? "true" : "false", live.c_str(), adaptive.c_str());
   LOG("load %s", payload);
 
   auto* pipeline = new StarfishMediaAPIs(nullptr);
@@ -258,7 +505,14 @@ bool Player::LoadPipeline() {
     return false;
   }
   loaded_ = true;
-  if (!paused_) pipeline->Play();
+  if (m.knobs.hdr_info && !m.hdr_info.empty()) {
+    bool ok = pipeline->setHdrInfo(m.hdr_info.c_str());
+    LOG("setHdrInfo %s -> %d", m.hdr_info.c_str(), ok);
+  } else {
+    LOG("no setHdrInfo (%s)", m.hdr_info.empty() ? "no HDR colour data in the container" : "off");
+  }
+  // Play() waits for the first fed picture (FeedLoop): starting the clock with nothing decoded makes
+  // a 4K decoder start behind.
   Emit({{"event", "initialized"},
         {"duration", std::to_string(m.duration_ms)},
         {"width", std::to_string(m.width)},
@@ -272,16 +526,24 @@ bool Player::FeedPacket(const uint8_t* data, int size, int64_t pts_ns, int es) {
   char json[160];
   snprintf(json, sizeof json, "{\"bufferAddr\":\"%p\",\"bufferSize\":%d,\"pts\":%" PRId64 ",\"esData\":%d}",
            static_cast<const void*>(data), size, std::max<int64_t>(0, pts_ns), es);
-  static int logged_errors = 0;
+  // "BufferFull": the pipeline is full, try again shortly. "Error": it is not taking data right now
+  // (just after Load, around a seek); dropping the packet would corrupt every picture that refers
+  // to it, so it is retried too, for up to 3 s.
+  int errors = 0;
   while (!stop_ && seek_request_ms_ < 0) {
     std::string reply = pipeline_->Feed(json);
-    if (reply.find("Ok") != std::string::npos) return true;
-    if (reply.find("BufferFull") != std::string::npos) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
+    if (reply.find("Ok") != std::string::npos) {
+      if (errors > 0) {
+        feed_error_retries_ += errors;
+        LOG("feed es=%d accepted after %d error replies (pts %" PRId64 " ms)", es, errors, pts_ns / 1000000);
+      }
+      return true;
     }
-    if (logged_errors++ < 20) LOG("feed es=%d refused: %s", es, reply.c_str());
-    return false;
+    if (reply.find("BufferFull") == std::string::npos && ++errors > 300) {
+      LOG("feed es=%d dropped after %d error replies: %s", es, errors, reply.c_str());
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return false;
 }
@@ -290,6 +552,20 @@ void Player::FeedLoop() {
   Media& m = *media_;
   AVPacket* packet = av_packet_alloc();
   AVPacket* out = av_packet_alloc();
+  std::deque<AVPacket*> held;  // knobs.hold_packets: fed packets kept alive for a while
+  auto release = [&](AVPacket* p) {
+    if (m.knobs.hold_packets <= 0) {
+      av_packet_unref(p);
+      return;
+    }
+    AVPacket* keep = av_packet_alloc();
+    av_packet_move_ref(keep, p);
+    held.push_back(keep);
+    while (static_cast<int>(held.size()) > m.knobs.hold_packets) {
+      av_packet_free(&held.front());
+      held.pop_front();
+    }
+  };
   bool eos = false;
   bool logged_position = false;
 
@@ -299,6 +575,7 @@ void Player::FeedLoop() {
       av_seek_frame(m.format, -1, m.start_us + seek_ms * 1000, AVSEEK_FLAG_BACKWARD);
       av_bsf_flush(m.annexb);
       m.anchor_pending = true;
+      m.fresh_start = false;
       eos = false;
     }
 
@@ -308,16 +585,20 @@ void Player::FeedLoop() {
     }
 
     // Keep the feed a few seconds ahead of the picture.
-    int64_t played_ns;
+    int64_t played_ns = position_ns_;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      played_ns = pipeline_->getCurrentPlaytime();
+      auto now = std::chrono::steady_clock::now();
+      if (played_ns > 0 && now - m.last_lead_log > std::chrono::seconds(5)) {
+        m.last_lead_log = now;
+        LOG("lead: fed %.2f s ahead of the picture (position %.1f s)",
+            (last_fed_video_ns_ - pts_shift_ns_ - played_ns) / 1e9, (played_ns + pts_shift_ns_) / 1e9);
+      }
     }
     if (!logged_position && played_ns > 0) {
-      LOG("first playtime value %lld (fed video up to %" PRId64 " ns)", played_ns, last_fed_video_ns_.load());
+      LOG("first position %" PRId64 " ns (fed video up to %" PRId64 " ns)", played_ns, last_fed_video_ns_.load());
       logged_position = true;
     }
-    if (!m.anchor_pending && played_ns > 0 && last_fed_video_ns_ - played_ns > kMaxFeedAheadNs) {
+    if (!m.anchor_pending && played_ns > 0 && last_fed_video_ns_ - pts_shift_ns_ - played_ns > kMaxFeedAheadNs) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
@@ -342,38 +623,120 @@ void Player::FeedLoop() {
     int64_t pts_ns = pts == AV_NOPTS_VALUE ? 0
         : av_rescale_q(pts, st->time_base, AVRational{1, 1000000000}) - m.start_us * 1000;
 
-    if (m.anchor_pending) {
-      // Land on a video keyframe: anchor the pipeline's timeline there, drop what came before.
-      if (packet->stream_index != m.video || !(packet->flags & AV_PKT_FLAG_KEY)) {
-        av_packet_unref(packet);
-        continue;
-      }
-      int64_t anchor_ms = std::max<int64_t>(0, pts_ns / 1000000);
-      bool ok;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ok = pipeline_->Seek(std::to_string(anchor_ms).c_str());
-      }
-      LOG("seek anchored at %" PRId64 " ms (%s)", anchor_ms, ok ? "ok" : "refused");
-      m.anchor_pending = false;
-      Emit({{"event", "seeked"}, {"position", std::to_string(anchor_ms)}});
+    if (m.anchor_pending && (packet->stream_index != m.video || !(packet->flags & AV_PKT_FLAG_KEY))) {
+      av_packet_unref(packet);  // after a seek: nothing before the landing keyframe
+      continue;
     }
 
     if (packet->stream_index == m.video) {
-      if (av_bsf_send_packet(m.annexb, packet) == 0) {
-        while (av_bsf_receive_packet(m.annexb, out) == 0) {
+      // MP4/MKV (length-prefixed): our own conversion, parameter sets only in front of keyframes
+      // (ffmpeg's filter also repeats the codec record's SEI arrays). Annex B sources: the filter.
+      bool own = m.own_annexb;
+      bool sent;
+      if (own) {
+        sent = LengthPrefixedToAnnexB(packet->data, packet->size, m.nal_length_size, m.is_hevc, m.params, &m.conv);
+        if (sent) {
+          av_packet_unref(out);
+          sent = av_new_packet(out, static_cast<int>(m.conv.size())) == 0;
+          if (sent) {
+            memcpy(out->data, m.conv.data(), m.conv.size());
+            out->pts = packet->pts;
+            out->dts = packet->dts;
+            out->flags = packet->flags;
+          }
+        }
+      } else {
+        sent = av_bsf_send_packet(m.annexb, packet) == 0;
+      }
+      if (sent) {
+        for (bool first = true; own ? first : av_bsf_receive_packet(m.annexb, out) == 0; first = false) {
           int64_t opts = out->pts != AV_NOPTS_VALUE ? out->pts : out->dts;
           int64_t ns = opts == AV_NOPTS_VALUE ? pts_ns
               : av_rescale_q(opts, st->time_base, AVRational{1, 1000000000}) - m.start_us * 1000;
-          if (FeedPacket(out->data, out->size, ns, 1)) last_fed_video_ns_ = ns;
-          av_packet_unref(out);
+          if (m.anchor_pending) {
+            // The C1's Dolby Vision splitter accepts only an IDR as the first picture after a start
+            // or a seek (other random access pictures leave it buffering), so skip to one.
+            if (m.dv_declared) {
+              int vcl = HevcFirstVclType(out->data, out->size);
+              if (vcl != 19 && vcl != 20) {
+                av_packet_unref(out);
+                continue;
+              }
+            }
+            int64_t anchor_ms = std::max<int64_t>(0, ns / 1000000);
+            bool ok = true;
+            if (m.initial_start) {
+              // Starting part-way in: shift the timeline so the first picture is at 0.
+              pts_shift_ns_ = std::max<int64_t>(0, ns);
+              position_ns_ = 0;
+            } else if (!m.fresh_start) {
+              std::lock_guard<std::mutex> lock(mutex_);
+              ok = pipeline_->Seek(std::to_string(anchor_ms).c_str());
+              pts_shift_ns_ = 0;
+              position_ns_ = anchor_ms * 1000000;
+            }
+            m.initial_start = false;
+            m.fresh_start = false;
+            LOG("anchored at %" PRId64 " ms (%s, shift %" PRId64 " ms)", anchor_ms, ok ? "ok" : "refused",
+                static_cast<int64_t>(pts_shift_ns_ / 1000000));
+            m.anchor_pending = false;
+            Emit({{"event", "seeked"}, {"position", std::to_string(anchor_ms)}});
+          }
+          // LG's pipeline rounds fed PTS onto its own frame lattice (to the nearest tick); with the
+          // exact PTS of 1001/24000 content the Dolby Vision metadata misses its frame about 2 in
+          // every 12, a pulse of wrong brightness/colour. One nanosecond earlier lands every frame
+          // on the right tick (measured by PlxNative, docs/dolby-vision.md "The fix").
+          int size = m.knobs.drop_rpu && av_packet_make_writable(out) == 0 ? StripNalType(out->data, out->size, 62) : out->size;
+          const uint8_t* data = out->data;
+          if (m.is_hevc && m.knobs.strip_hdr10plus) {
+            // HDR10+ dynamic metadata in a fed HEVC stream upsets LG's decoder (webos-native-app-kit:
+            // "webOS decoders stall on it"; Jellyfin's server strips it as well when it repackages).
+            m.au.assign(out->data, out->data + size);
+            if (HevcStripHdr10Plus(&m.au)) {
+              if (m.hdr10plus_stripped++ == 0) LOG("removing HDR10+ metadata from the HEVC stream");
+              data = m.au.data();
+              size = static_cast<int>(m.au.size());
+            }
+          }
+          if (m.logged_aus < 3) {
+            // The first access units' bytes and NAL types, to compare with other players' logs.
+            char head[200];
+            int len = 0;
+            for (int b = 0; b < size && b < 40; b++) len += snprintf(head + len, sizeof head - len, "%02x ", data[b]);
+            std::string types;
+            for (int b = 0; b + 3 < size; b++) {
+              if (data[b] == 0 && data[b + 1] == 0 && data[b + 2] == 1) {
+                types += std::to_string((data[b + 3] >> 1) & 0x3f) + ",";
+                b += 2;
+              }
+            }
+            LOG("AU#%d size=%d nal types=[%s] head=[%s]", m.logged_aus, size, types.c_str(), head);
+            m.logged_aus++;
+          }
+          int64_t fed = ns - pts_shift_ns_ + m.knobs.pts_nudge_ns;
+          if (FeedPacket(data, size, fed > 0 ? fed : 0, 1)) {
+            last_fed_video_ns_ = ns;
+            if (m.first_fed_ns < 0) m.first_fed_ns = ns;
+            // Prime about a second of pictures before the clock starts, as PlxNative does.
+            if (!m.started && ns - m.first_fed_ns >= 1000000000LL) {
+              m.started = true;
+              if (!paused_) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pipeline_->Play();
+              }
+              LOG("primed %.2f s of video; play", (ns - m.first_fed_ns) / 1e9);
+            }
+          }
+          release(out);
         }
       }
     } else if (packet->stream_index == m.audio) {
-      FeedPacket(packet->data, packet->size, pts_ns, 2);
+      FeedPacket(packet->data, packet->size, pts_ns - pts_shift_ns_, 2);
+      release(packet);
     }
     av_packet_unref(packet);
   }
+  for (AVPacket* p : held) av_packet_free(&p);
   av_packet_free(&packet);
   av_packet_free(&out);
 }
@@ -383,9 +746,13 @@ void Player::PipelineCallback(int type, long long num, const char* str, void* co
 }
 
 void Player::OnPipelineEvent(int type, long long num, const char* str) {
+  if (type == 0) {  // frame ready: num is the presented PTS (ns)
+    if (num > 0) position_ns_ = num;
+    return;
+  }
   std::string s = str ? str : "";
-  // Frame-ready (0) and the periodic counters arrive many times a second: not logged.
-  if (type != 0 && !(type >= 46 && type <= 49)) LOG("event type=%d num=%lld str=%s", type, num, s.c_str());
+  // 45 and the counters (46-49) arrive many times a second: not logged.
+  if (type != 45 && !(type >= 46 && type <= 49)) LOG("event type=%d num=%lld str=%s", type, num, s.c_str());
   if (type == 23) {
     std::lock_guard<std::mutex> lock(mutex_);
     unloaded_ = true;
@@ -396,7 +763,7 @@ void Player::OnPipelineEvent(int type, long long num, const char* str) {
     Emit({{"event", "completed"}});
   } else if (type == 18) {
     Emit({{"event", "error"}, {"message", "Playback error " + std::to_string(num) + (s.empty() ? "" : ": " + s)}});
-  } else if (type != 0 && type < 46) {
+  } else if (type < 45) {
     Emit({{"event", "native"}, {"type", std::to_string(type)}, {"num", std::to_string(num)}, {"str", s}});
   }
 }
