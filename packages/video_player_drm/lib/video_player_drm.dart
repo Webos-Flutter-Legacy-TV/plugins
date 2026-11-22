@@ -92,6 +92,8 @@ class _VideoWidgetState extends State<_VideoWidget> {
   }
 
   final int kMovingTimerMiliseconds = 100;
+  // Twice: the hole may take more than one frame to reach the screen.
+  static const List<int> kReplaceDelaysMs = <int>[300, 1000];
   TimerStage _timerStage = TimerStage.init;
   bool _moving = false;
   double _x = 0;
@@ -153,6 +155,18 @@ class _VideoWidgetState extends State<_VideoWidget> {
         } else {
           _resetRect(false);
           setState(() {});
+          // Place the video again once the hole is back on screen. The
+          // placement sent while moving reaches the compositor while the
+          // area is still opaque (the hole is hidden during a move); webOS 6
+          // then keeps the video hidden behind the hole until it is placed
+          // again (as in video_player, 7a53a97).
+          for (final int ms in kReplaceDelaysMs) {
+            Future<void>.delayed(Duration(milliseconds: ms), () {
+              if (mounted && _exported && !_moving) {
+                widget.player.viewRect(widget.textureId, _x, _y, _w, _h);
+              }
+            });
+          }
         }
       }
     });
