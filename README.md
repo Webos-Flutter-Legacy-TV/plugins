@@ -21,7 +21,7 @@ dependencies:
   video_player_webos:           # its webOS implementation, from this repository
     git:
       url: https://github.com/Webos-Flutter-Legacy-TV/plugins.git
-      ref: legacy-v0.1.0        # or main for the latest fixes
+      ref: legacy-v0.2.0        # or main for the latest fixes
       path: packages/video_player
 ```
 
