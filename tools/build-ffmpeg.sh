@@ -7,6 +7,8 @@
 #
 #   tools/build-ffmpeg.sh <ffmpeg source tarball> <out dir>
 #
+# Patches in tools/ffmpeg-patches/ are applied first (dovi_rpu: profile 7 to 8.1).
+#
 # Output: <out dir>/{include,lib} (libavformat, libavcodec, libavutil, libswresample).
 set -euo pipefail
 src_tar=$(realpath "$1"); out=$(realpath -m "$2")
@@ -20,6 +22,8 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/ffbuild.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 tar -xf "$src_tar" -C "$work" --strip-components=1
 cd "$work"
+# Our changes to FFmpeg (LGPL: the modified source is these patches on the official tarball).
+for p in "$here"/tools/ffmpeg-patches/*.patch; do patch -p1 --quiet < "$p"; done
 ./configure \
   --prefix="$out" \
   --enable-cross-compile --arch=arm --cpu=cortex-a9 --target-os=linux \

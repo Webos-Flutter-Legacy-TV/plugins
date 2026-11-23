@@ -15,6 +15,7 @@ extern "C" {
 #include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libavutil/dovi_meta.h>
+#include <libavutil/opt.h>
 #include <libavutil/mastering_display_metadata.h>
 }
 
@@ -88,6 +89,7 @@ struct Knobs {
   bool low_delay = false;      // lowDelayMode
   int max_frame_rate = 60;     // adaptiveStreaming.maxFrameRate
   bool declare_dv = true;      // send DolbyHdrInfo for profiles 5 / 8
+  bool p7_to_81 = true;        // profile 7: convert the RPUs to 8.1, drop the enhancement layer, declare 8
   bool drop_rpu = false;       // drop Dolby Vision RPU NAL units (type 62) before feeding
   int hold_packets = 0;        // keep the last N fed packets alive (does Feed read later?)
   bool adaptive = true;        // send the adaptiveStreaming block (max size / rate envelope)
@@ -117,6 +119,7 @@ Knobs ReadKnobs() {
     else if (k2 == "max_frame_rate") k.max_frame_rate = static_cast<int>(v);
     else if (k2 == "declare_dv") k.declare_dv = v != 0;
     else if (k2 == "drop_rpu") k.drop_rpu = v != 0;
+    else if (k2 == "p7_to_81") k.p7_to_81 = v != 0;
     else if (k2 == "hold_packets") k.hold_packets = static_cast<int>(v);
     else if (k2 == "adaptive") k.adaptive = v != 0;
     else if (k2 == "live") k.live = v != 0;
@@ -135,6 +138,27 @@ Knobs ReadKnobs() {
 }
 
 // Removes HEVC NAL units of one type from an Annex B buffer (in place); returns the new size.
+// Annex B (start codes) -> NAL units each prefixed with its length (nal_length_size bytes).
+void AnnexBToLengthPrefixed(const uint8_t* d, int n, int nal_length_size, std::vector<uint8_t>* out) {
+  out->clear();
+  auto next_start = [&](int from) {
+    for (int j = from; j + 2 < n; j++)
+      if (d[j] == 0 && d[j + 1] == 0 && d[j + 2] == 1) return j;
+    return n;
+  };
+  int start = next_start(0);
+  while (start < n) {
+    int payload = start + 3;
+    int end = next_start(payload);
+    int nal_end = end;
+    while (nal_end > payload && d[nal_end - 1] == 0) nal_end--;  // trailing zeros / 4-byte start code
+    uint32_t len = static_cast<uint32_t>(nal_end - payload);
+    for (int b = nal_length_size - 1; b >= 0; b--) out->push_back(static_cast<uint8_t>(len >> (8 * b)));
+    out->insert(out->end(), d + payload, d + nal_end);
+    start = end;
+  }
+}
+
 int StripNalType(uint8_t* d, int n, int drop_type) {
   int out = 0, i = 0;
   auto next_start = [&](int from) {
@@ -244,6 +268,11 @@ bool AdtsHeader(const uint8_t* asc, int asc_size, int payload, uint8_t out[7]) {
 struct Player::Media {
   AVFormatContext* format = nullptr;
   AVBSFContext* annexb = nullptr;  // MP4/MKV length-prefixed NAL units -> Annex B start codes
+  AVBSFContext* to81 = nullptr;    // Dolby Vision profile 7 RPUs -> 8.1 (our dovi_rpu patch)
+  int to81_errors = 0;
+  int non_idr_skipped = 0;
+  bool to81_annexb_logged = false;
+  std::vector<uint8_t> relen;  // an access unit re-prefixed with NAL lengths
   int video = -1;
   int audio = -1;
   const char* video_codec = nullptr;
@@ -280,6 +309,7 @@ struct Player::Media {
 
   ~Media() {
     if (annexb) av_bsf_free(&annexb);
+    if (to81) av_bsf_free(&to81);
     if (format) avformat_close_input(&format);
   }
 };
@@ -386,10 +416,26 @@ bool Player::Open() {
                                                            vs->codecpar->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF)) {
     auto* dovi = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data);
     m.dv_profile = dovi->dv_profile;
-    // Profile 7 (dual layer) is not decoded as Dolby Vision by LG TVs: its HDR10 base plays.
+    // Profile 7 (dual layer) is not decoded as Dolby Vision by LG TVs. Converted to 8.1 (the
+    // enhancement layer dropped, each RPU rewritten as dovi_tool's mode 2 does) it plays as Dolby
+    // Vision on its HDR10 base layer; without the conversion only the HDR10 base plays.
+    const bool p7 = m.dv_profile == 7;
+    if (p7 && m.knobs.declare_dv && m.knobs.p7_to_81) {
+      const AVBitStreamFilter* f = av_bsf_get_by_name("dovi_rpu");
+      if (f && av_bsf_alloc(f, &m.to81) == 0 && avcodec_parameters_copy(m.to81->par_in, vs->codecpar) >= 0 &&
+          av_opt_set_int(m.to81->priv_data, "to81", 1, 0) >= 0 &&
+          av_opt_set_int(m.to81->priv_data, "compression", 0, 0) >= 0) {
+        m.to81->time_base_in = vs->time_base;
+        if (av_bsf_init(m.to81) < 0) av_bsf_free(&m.to81);
+      } else if (m.to81) {
+        av_bsf_free(&m.to81);
+      }
+      if (m.to81) m.dv_profile = 8;
+    }
     m.dv_declared = m.knobs.declare_dv && (m.dv_profile == 5 || m.dv_profile == 8);
     LOG("dolby vision profile %d level %d bl_compat %d el %d -> %s", dovi->dv_profile, dovi->dv_level,
-        dovi->dv_bl_signal_compatibility_id, dovi->el_present_flag, m.dv_declared ? "declared" : "base layer");
+        dovi->dv_bl_signal_compatibility_id, dovi->el_present_flag,
+        m.to81 ? "converted to 8.1, declared" : m.dv_declared ? "declared" : p7 ? "base layer (8.1 conversion unavailable)" : "base layer");
   }
 
   int a = options_.audio_stream;
@@ -641,6 +687,7 @@ void Player::FeedLoop() {
     if (seek_ms >= 0) {
       av_seek_frame(m.format, -1, m.start_us + seek_ms * 1000, AVSEEK_FLAG_BACKWARD);
       av_bsf_flush(m.annexb);
+      if (m.to81) av_bsf_flush(m.to81);
       m.anchor_pending = true;
       m.fresh_start = false;
       if (m.transcoder) m.transcoder->Flush();
@@ -696,6 +743,36 @@ void Player::FeedLoop() {
       continue;
     }
 
+    if (packet->stream_index == m.video && m.to81) {
+      // Profile 7 -> 8.1: the RPU (last NAL unit of the access unit) rewritten in place; one packet
+      // in, one out, still length-prefixed.
+      if (av_bsf_send_packet(m.to81, packet) < 0 || av_bsf_receive_packet(m.to81, packet) < 0) {
+        if (m.to81_errors++ < 5) LOG("profile 8.1 conversion failed for a packet (pts %" PRId64 ")", packet->pts);
+        av_packet_unref(packet);
+        continue;
+      }
+      // FFmpeg's bitstream rewriting writes the access unit back with Annex B start codes; the
+      // conversion below expects the container's length prefixes.
+      if (packet->size > 4 && packet->data[0] == 0 && packet->data[1] == 0 &&
+          (packet->data[2] == 1 || (packet->data[2] == 0 && packet->data[3] == 1))) {
+        if (!m.to81_annexb_logged) {
+          m.to81_annexb_logged = true;
+          LOG("profile 8.1 conversion: output has start codes, re-prefixing with %d-byte lengths", m.nal_length_size);
+        }
+        AnnexBToLengthPrefixed(packet->data, packet->size, m.nal_length_size, &m.relen);
+        if (av_packet_make_writable(packet) < 0) {
+          av_packet_unref(packet);
+          continue;
+        }
+        int diff = static_cast<int>(m.relen.size()) - packet->size;
+        if (diff > 0 && av_grow_packet(packet, diff) < 0) {
+          av_packet_unref(packet);
+          continue;
+        }
+        if (diff < 0) av_shrink_packet(packet, static_cast<int>(m.relen.size()));
+        memcpy(packet->data, m.relen.data(), m.relen.size());
+      }
+    }
     if (packet->stream_index == m.video) {
       // MP4/MKV (length-prefixed): our own conversion, parameter sets only in front of keyframes
       // (ffmpeg's filter also repeats the codec record's SEI arrays). Annex B sources: the filter.
@@ -727,6 +804,7 @@ void Player::FeedLoop() {
             if (m.dv_declared) {
               int vcl = HevcFirstVclType(out->data, out->size);
               if (vcl != 19 && vcl != 20) {
+                if (m.non_idr_skipped++ < 3) LOG("start/seek: skipping a keyframe of NAL type %d (waiting for an IDR)", vcl);
                 av_packet_unref(out);
                 continue;
               }
@@ -755,6 +833,10 @@ void Player::FeedLoop() {
           // every 12, a pulse of wrong brightness/colour. One nanosecond earlier lands every frame
           // on the right tick (measured by PlxNative, docs/dolby-vision.md "The fix").
           int size = m.knobs.drop_rpu && av_packet_make_writable(out) == 0 ? StripNalType(out->data, out->size, 62) : out->size;
+          if (m.to81 && av_packet_make_writable(out) == 0) {
+            // The profile 7 enhancement layer (NAL type 63) is not decoded by the TV.
+            size = StripNalType(out->data, size, 63);
+          }
           const uint8_t* data = out->data;
           if (m.is_hevc && m.knobs.strip_hdr10plus) {
             // HDR10+ dynamic metadata in a fed HEVC stream upsets LG's decoder (webos-native-app-kit:
