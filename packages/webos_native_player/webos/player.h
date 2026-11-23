@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // One playback: a thread that reads the source with FFmpeg and feeds its elementary streams to
 // LG's media pipeline (StarfishMediaAPIs, BUFFERSTREAM), which decodes and draws them in the
 // exported window the Dart side created.

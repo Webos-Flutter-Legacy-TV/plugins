@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // Link-time stand-in for the firmware's libplayerAPIs.so.1: same SONAME and the symbols this
 // plugin uses, no behaviour. It is never packaged; on the TV the real library is loaded.
 #include "starfish.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // Method channel "webos_native_player": open / play / pause / seekTo / position / dispose.
 // Each player gets an event channel "webos_native_player/events/<id>".
 #include "include/webos_native_player/webos_native_player_plugin.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // HEVC Annex B helpers: removing HDR10+ dynamic metadata (SMPTE ST 2094-40, carried as an ITU-T
 // T.35 SEI message) from an access unit. LG's webOS HEVC decoders mis-handle it in a fed stream;
 // Jellyfin's server strips it too when it repackages (hevc_metadata remove_hdr10plus).

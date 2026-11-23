@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // LG's in-process media player, StarfishMediaAPIs (libplayerAPIs.so.1 in the TV firmware).
 // LG publishes no header for it; the methods below are the ones this plugin calls, with the
 // signatures the library exports (checked with `nm -D | c++filt` on webOS 6.5.3). Mangled names

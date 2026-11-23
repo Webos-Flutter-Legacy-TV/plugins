@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // Video on LG webOS TVs through the TV's own decoders: the plugin reads the source with a bundled
 // FFmpeg and feeds the elementary streams to LG's media pipeline, which draws into an exported
 // window under the Flutter surface. The page above the video must be transparent there.

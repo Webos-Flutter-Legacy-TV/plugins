@@ -13,6 +13,12 @@ and its `--legacy` build. **Website:** https://webos-flutter-legacy-tv.github.io
 | `flutter_secure_storage` | Works without a system key service (webOS 6) by encrypting in the app sandbox |
 | `webos_service_bridge` | Subscription cancel errors |
 
+Added in this repository (not in LG's plugins):
+
+| Plugin | What it does |
+| --- | --- |
+| [`webos_native_player`](packages/webos_native_player/) | Video through the TV's own decoders with a bundled FFmpeg reading the file: 4K HDR and Dolby Vision (profile 7 converted to 8.1), DTS and TrueHD (re-encoded on the TV), without a server converting anything |
+
 Use a plugin from here with a git dependency:
 
 ```yaml

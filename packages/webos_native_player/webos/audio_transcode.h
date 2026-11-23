@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // Audio the TV cannot decode itself (DTS, TrueHD, FLAC, Opus, ...): decoded with FFmpeg and
 // re-encoded to E-AC-3 (Dolby Digital Plus) or AC-3 5.1 / stereo, which LG TVs and soundbars take.
 #ifndef WEBOS_NATIVE_PLAYER_AUDIO_TRANSCODE_H_

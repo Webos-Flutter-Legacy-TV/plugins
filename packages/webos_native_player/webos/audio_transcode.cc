@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 #include "audio_transcode.h"
 
 #include <algorithm>
