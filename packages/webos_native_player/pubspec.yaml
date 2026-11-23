@@ -1,6 +1,6 @@
 name: webos_native_player
 description: Plays video on LG webOS TVs by feeding the TV's own decoders (StarfishMediaAPIs buffer feed), with a bundled FFmpeg reading the source.
-version: 0.1.0
+version: 0.2.0
 publish_to: none
 
 environment:

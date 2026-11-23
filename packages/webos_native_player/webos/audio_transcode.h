@@ -15,6 +15,8 @@ struct AVFrame;
 struct SwrContext;
 struct AVAudioFifo;
 struct AVRational;
+struct AVFilterGraph;
+struct AVFilterContext;
 
 class AudioTranscoder {
  public:
@@ -27,7 +29,9 @@ class AudioTranscoder {
   // Sets up decoder, resampler and encoder for `par`. Returns false (with `error`) when the codec
   // cannot be decoded with this build.
   // eac3: encode E-AC-3 (Dolby Digital Plus) instead of AC-3.
-  bool Open(const AVCodecParameters* par, int bitrate, bool eac3, std::string* error);
+  // tempo: playback speed (0.5-2.0); the sound is time-stretched with its pitch kept (atempo) and
+  // the PTS handed out stay on the source's timeline.
+  bool Open(const AVCodecParameters* par, int bitrate, bool eac3, std::string* error, double tempo = 1.0);
 
   // Feeds one source packet (time base `tb`); encoded frames come out through `out`.
   void Push(const AVPacket* packet, AVRational tb, const Output& out);
@@ -41,6 +45,9 @@ class AudioTranscoder {
 
  private:
   void Encode(const Output& out, bool drain);
+  bool OpenTempo();
+  void CloseTempo();
+  void WriteFifo(uint8_t** data, int samples);
 
   AVCodecContext* dec_ = nullptr;
   AVCodecContext* enc_ = nullptr;
@@ -52,6 +59,12 @@ class AudioTranscoder {
   int out_channels_ = 0;
   int out_rate_ = 0;
   int64_t next_pts_ns_ = -1;  // PTS of the first sample waiting in the FIFO
+  double tempo_ = 1.0;
+  AVFilterGraph* graph_ = nullptr;
+  AVFilterContext* src_ = nullptr;
+  AVFilterContext* sink_ = nullptr;
+  AVFrame* tempo_in_ = nullptr;
+  AVFrame* tempo_out_ = nullptr;
   std::string description_;
 };
 

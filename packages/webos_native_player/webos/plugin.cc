@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Method channel "webos_native_player": open / play / pause / seekTo / position / dispose.
+// Method channel "webos_native_player": open / play / pause / seekTo / position / status / dispose.
 // Each player gets an event channel "webos_native_player/events/<id>".
 #include "include/webos_native_player/webos_native_player_plugin.h"
 
@@ -91,6 +91,8 @@ class NativePlayerPlugin : public flutter::Plugin {
       options.window_id = StringArg(a, "windowId");
       options.start_ms = IntArg(a, "startMs", 0);
       options.audio_stream = static_cast<int>(IntArg(a, "audioStream", -1));
+      options.subtitle_stream = static_cast<int>(IntArg(a, "subtitleStream", -1));
+      options.audio_delay_ms = IntArg(a, "audioDelayMs", 0);
       int64_t id = next_id_++;
       Entry& entry = players_[id];
       entry.channel = std::make_unique<flutter::EventChannel<EncodableValue>>(
@@ -137,6 +139,57 @@ class NativePlayerPlugin : public flutter::Plugin {
       result->Success();
     } else if (method == "position") {
       result->Success(EncodableValue(player.PositionMs()));
+    } else if (method == "setAudioStream") {
+      player.SetAudioStream(static_cast<int>(IntArg(a, "index", -1)));
+      result->Success();
+    } else if (method == "setSpeed") {
+      player.SetSpeed(static_cast<int>(IntArg(a, "permille", 1000)));
+      result->Success();
+    } else if (method == "setAudioDelay") {
+      player.SetAudioDelay(IntArg(a, "ms", 0));
+      result->Success();
+    } else if (method == "setSubtitleStream") {
+      player.SetSubtitleStream(static_cast<int>(IntArg(a, "index", -1)));
+      result->Success();
+    } else if (method == "subtitles") {
+      int generation = 0;
+      flutter::EncodableList cues;
+      for (auto& c : player.TakeSubtitles(&generation)) {
+        flutter::EncodableList images;
+        for (auto& img : c.images) {
+          images.push_back(EncodableValue(EncodableMap{
+              {EncodableValue("x"), EncodableValue(img.x)},
+              {EncodableValue("y"), EncodableValue(img.y)},
+              {EncodableValue("w"), EncodableValue(img.width)},
+              {EncodableValue("h"), EncodableValue(img.height)},
+              {EncodableValue("rgba"), EncodableValue(std::move(img.rgba))}}));
+        }
+        cues.push_back(EncodableValue(EncodableMap{
+            {EncodableValue("start"), EncodableValue(static_cast<int64_t>(c.start_ms))},
+            {EncodableValue("end"), EncodableValue(static_cast<int64_t>(c.end_ms))},
+            {EncodableValue("cw"), EncodableValue(c.canvas_width)},
+            {EncodableValue("ch"), EncodableValue(c.canvas_height)},
+            {EncodableValue("text"), EncodableValue(c.text)},
+            {EncodableValue("images"), EncodableValue(std::move(images))}}));
+      }
+      result->Success(EncodableValue(EncodableMap{{EncodableValue("generation"), EncodableValue(generation)},
+                                                  {EncodableValue("cues"), EncodableValue(std::move(cues))}}));
+    } else if (method == "assFrame") {
+      SubtitleImage img;
+      if (!player.RenderAss(IntArg(a, "ms", 0), static_cast<int>(IntArg(a, "w", 1920)),
+                            static_cast<int>(IntArg(a, "h", 1080)), &img)) {
+        result->Success();  // unchanged
+      } else {
+        result->Success(EncodableValue(EncodableMap{{EncodableValue("x"), EncodableValue(img.x)},
+                                                    {EncodableValue("y"), EncodableValue(img.y)},
+                                                    {EncodableValue("w"), EncodableValue(img.width)},
+                                                    {EncodableValue("h"), EncodableValue(img.height)},
+                                                    {EncodableValue("rgba"), EncodableValue(std::move(img.rgba))}}));
+      }
+    } else if (method == "status") {
+      EncodableMap map;
+      for (const auto& kv : player.Status()) map[EncodableValue(kv.first)] = EncodableValue(kv.second);
+      result->Success(EncodableValue(map));
     } else if (method == "dispose") {
       Release(std::move(it->second.player));
       players_.erase(it);

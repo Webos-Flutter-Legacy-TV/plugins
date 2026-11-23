@@ -21,6 +21,7 @@ extern "C" {
 }
 
 #include "audio_transcode.h"
+#include "av1_obu.h"
 #include "hevc_sei.h"
 #include "starfish.h"
 
@@ -37,6 +38,10 @@ namespace {
 // How far ahead of the picture the feed may run. The pipeline's own buffers say BufferFull
 // long before this on most streams; this keeps memory bounded on low-bitrate ones.
 constexpr int64_t kMaxFeedAheadNs = 6LL * 1000 * 1000 * 1000;
+// How long the picture may stand still, with data fed ahead of it, before playback counts as stalled.
+constexpr int kStallMs = 8000;
+// Font for ASS styles whose font is not attached to the file (mounted in the app's jail).
+constexpr const char* kDefaultFont = "/usr/share/fonts/DroidSans.ttf";
 
 int Interrupted(void* opaque) {
   return static_cast<std::atomic<bool>*>(opaque)->load() ? 1 : 0;
@@ -55,6 +60,7 @@ const char* VideoCodecName(AVCodecID id) {
   switch (id) {
     case AV_CODEC_ID_H264: return "H264";
     case AV_CODEC_ID_HEVC: return "H265";
+    case AV_CODEC_ID_AV1: return "AV1";
     default: return nullptr;
   }
 }
@@ -90,7 +96,8 @@ struct Knobs {
   bool low_delay = false;      // lowDelayMode
   int max_frame_rate = 60;     // adaptiveStreaming.maxFrameRate
   bool declare_dv = true;      // send DolbyHdrInfo for profiles 5 / 8
-  bool p7_to_81 = true;        // profile 7: convert the RPUs to 8.1, drop the enhancement layer, declare 8
+  bool p7_to_81 = true;
+  bool libass = true;          // ASS / SSA drawn with libass (else shown as plain text)        // profile 7: convert the RPUs to 8.1, drop the enhancement layer, declare 8
   bool drop_rpu = false;       // drop Dolby Vision RPU NAL units (type 62) before feeding
   int hold_packets = 0;        // keep the last N fed packets alive (does Feed read later?)
   bool adaptive = true;        // send the adaptiveStreaming block (max size / rate envelope)
@@ -121,6 +128,7 @@ Knobs ReadKnobs() {
     else if (k2 == "declare_dv") k.declare_dv = v != 0;
     else if (k2 == "drop_rpu") k.drop_rpu = v != 0;
     else if (k2 == "p7_to_81") k.p7_to_81 = v != 0;
+    else if (k2 == "libass") k.libass = v != 0;
     else if (k2 == "hold_packets") k.hold_packets = static_cast<int>(v);
     else if (k2 == "adaptive") k.adaptive = v != 0;
     else if (k2 == "live") k.live = v != 0;
@@ -276,6 +284,8 @@ struct Player::Media {
   std::vector<uint8_t> relen;  // an access unit re-prefixed with NAL lengths
   int video = -1;
   int audio = -1;
+  int subtitle = -1;  // the subtitle stream decoded for Dart (-1: none)
+  std::unique_ptr<SubtitleDecoder> subdec;
   const char* video_codec = nullptr;
   const char* audio_codec = nullptr;
   int width = 0;
@@ -286,13 +296,16 @@ struct Player::Media {
   int audio_channels = 0;
   int audio_rate = 0;
   bool atmos = false;
-  int dv_profile = 0;    // Dolby Vision profile from the file's configuration record (0: none)
+  int dv_profile = 0;    // Dolby Vision profile declared to the pipeline (0: none)
+  int dv_source_profile = 0;  // the file's own profile (7 when converted to 8)
   bool dv_declared = false;  // told to the pipeline (profiles 5 and 8)
   bool anchor_pending = false;  // after a seek: drop until the landing keyframe, then Seek() there
   bool fresh_start = true;      // nothing fed yet and starting at 0: no Seek() needed
   bool initial_start = true;    // the first anchor of the session (no Seek possible yet)
   Knobs knobs;
   bool is_hevc = false;
+  bool is_av1 = false;
+  std::vector<uint8_t> av1_config;  // av1C configuration OBUs, in front of keyframes
   std::string hdr_info;         // setHdrInfo payload, empty when SDR or unknown
   bool started = false;         // Play() called once about a second is fed
   int64_t first_fed_ns = -1;
@@ -307,6 +320,9 @@ struct Player::Media {
   std::chrono::steady_clock::time_point last_lead_log{};
   std::vector<uint8_t> au;      // a rewritten access unit
   int64_t hdr10plus_stripped = 0;
+  int64_t watch_position_ns = -1;  // stall watchdog
+  std::chrono::steady_clock::time_point watch_since{};
+  int feed_drops = 0;              // packets the pipeline kept refusing, in a row
 
   ~Media() {
     if (annexb) av_bsf_free(&annexb);
@@ -317,6 +333,7 @@ struct Player::Media {
 
 Player::Player(PlayerOptions options, EventSink sink)
     : options_(std::move(options)), sink_(std::move(sink)), media_(new Media) {
+  audio_delay_ns_ = options_.audio_delay_ms * 1000000;
   thread_ = std::thread(&Player::Run, this);
 }
 
@@ -327,6 +344,31 @@ Player::~Player() {
 
 void Player::Emit(EventMap event) {
   if (sink_) sink_(std::move(event));
+}
+
+// One error per playback; the code lets the app decide (e.g. play with another engine).
+void Player::EmitError(const std::string& code, const std::string& message) {
+  if (failed_.exchange(true)) return;
+  LOG("error %s: %s", code.c_str(), message.c_str());
+  Emit({{"event", "error"}, {"code", code}, {"message", message}});
+}
+
+EventMap Player::Status() {
+  EventMap s;
+  {
+    std::lock_guard<std::mutex> lock(info_mutex_);
+    s = info_;
+    if (!hdr_type_.empty()) s["hdrType"] = hdr_type_;
+  }
+  const int64_t played = ToContentNs(position_ns_);
+  s["position"] = std::to_string(played / 1000000);
+  s["buffered"] = std::to_string(last_fed_video_ns_ / 1000000);
+  s["leadMs"] = std::to_string(std::max<int64_t>(0, last_fed_video_ns_ - played) / 1000000);
+  s["fedVideoBytes"] = std::to_string(fed_video_bytes_.load());
+  s["feedRetries"] = std::to_string(feed_error_retries_);
+  s["speed"] = std::to_string(speed_permille_.load());
+  s["maxSpeed"] = std::to_string(MaxSpeedPermille());
+  return s;
 }
 
 void Player::Play() {
@@ -343,15 +385,111 @@ void Player::Pause() {
 
 void Player::SeekTo(int64_t ms) { seek_request_ms_ = std::max<int64_t>(0, ms); }
 
+void Player::SetAudioStream(int index) { audio_request_ = index; }
+
+void Player::SetSubtitleStream(int index) { subtitle_request_ = index; }
+
+void Player::SetSpeed(int permille) { speed_request_ = std::min(2000, std::max(500, permille)); }
+
+int Player::MaxSpeedPermille() {
+  Media& m = *media_;
+  if (m.frame_rate.num <= 0 || m.frame_rate.den <= 0) return 2000;
+  const double fps = av_q2d(m.frame_rate);
+  return fps <= 30.0 ? 2000 : std::max(1000, static_cast<int>(60.0 / fps * 1000));
+}
+
+void Player::SetAudioDelay(int64_t ms) {
+  audio_delay_ns_ = ms * 1000000;
+  audio_delay_changed_ = true;
+}
+
+std::vector<SubtitleCue> Player::TakeSubtitles(int* generation) {
+  std::lock_guard<std::mutex> lock(cue_mutex_);
+  *generation = cue_generation_;
+  std::vector<SubtitleCue> out;
+  out.swap(cues_);
+  return out;
+}
+
+void Player::ResetSubtitles() {
+  Media& m = *media_;
+  if (m.subdec) m.subdec->Flush();
+  std::lock_guard<std::mutex> lock(cue_mutex_);
+  if (ass_) ass_->Flush();
+  cues_.clear();
+  cue_generation_++;
+}
+
+bool Player::RenderAss(int64_t time_ms, int canvas_w, int canvas_h, SubtitleImage* out) {
+  std::shared_ptr<AssRenderer> ass;
+  {
+    std::lock_guard<std::mutex> lock(cue_mutex_);
+    ass = ass_;
+  }
+  return ass && ass->Render(time_ms, canvas_w, canvas_h, out);
+}
+
+// "ass", "pictures", "text" or "none": how the current subtitle track reaches Dart.
+static const char* SubtitleMode(bool ass, const SubtitleDecoder* dec) {
+  return ass ? "ass" : !dec ? "none" : dec->image_based() ? "pictures" : "text";
+}
+
+// The subtitle track decoded for Dart (-1 or an unusable index: none).
+void Player::SetupSubtitle(int requested) {
+  Media& m = *media_;
+  m.subtitle = -1;
+  m.subdec.reset();
+  {
+    std::lock_guard<std::mutex> lock(cue_mutex_);
+    ass_.reset();
+  }
+  const AVCodecID id = requested >= 0 && requested < static_cast<int>(m.format->nb_streams)
+                           ? m.format->streams[requested]->codecpar->codec_id : AV_CODEC_ID_NONE;
+  if ((id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA) && m.knobs.libass) {
+    auto ass = std::make_shared<AssRenderer>();
+    std::string error;
+    if (ass->Open(m.format->streams[requested], m.format, kDefaultFont, m.width, m.height, &error)) {
+      m.subtitle = requested;
+      std::lock_guard<std::mutex> lock(cue_mutex_);
+      ass_ = std::move(ass);
+      LOG("subtitles: track %d (ASS, drawn with libass)", requested);
+    } else {
+      LOG("subtitles: ASS track %d not drawn (%s); as text", requested, error.c_str());
+    }
+  }
+  if (m.subtitle < 0 && requested >= 0 && requested < static_cast<int>(m.format->nb_streams) &&
+      m.format->streams[requested]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+    auto dec = std::make_unique<SubtitleDecoder>();
+    std::string error;
+    if (dec->Open(m.format->streams[requested], m.width, m.height, &error)) {
+      m.subtitle = requested;
+      m.subdec = std::move(dec);
+      LOG("subtitles: track %d (%s, %s)", requested, avcodec_get_name(m.format->streams[requested]->codecpar->codec_id),
+          m.subdec->image_based() ? "pictures" : "text");
+    } else {
+      LOG("subtitles: track %d not decoded (%s)", requested, error.c_str());
+    }
+  }
+  for (unsigned i = 0; i < m.format->nb_streams; i++) {
+    const bool keep = static_cast<int>(i) == m.video || static_cast<int>(i) == m.audio || static_cast<int>(i) == m.subtitle;
+    m.format->streams[i]->discard = keep ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+  }
+  ResetSubtitles();
+}
+
 int64_t Player::PositionMs() {
   // getCurrentPlaytime() stays 0 in buffer-feed mode (webOS 6.5.3); the frame-ready event carries
   // the presented PTS in nanoseconds of the fed timeline.
-  return (position_ns_ + pts_shift_ns_) / 1000000;
+  return ToContentNs(position_ns_) / 1000000;
 }
 
 void Player::Run() {
   if (Open() && LoadPipeline()) FeedLoop();
+  UnloadPipeline();
+  LOG("closed");
+}
 
+void Player::UnloadPipeline() {
   StarfishMediaAPIs* pipeline;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -371,7 +509,30 @@ void Player::Run() {
     // The pipeline may still call back into it: keep it alive rather than risk a crash.
     LOG("unload not confirmed; pipeline object left allocated");
   }
-  LOG("closed");
+  unloaded_ = false;
+}
+
+// A new pipeline in the same window, starting at at_ms (the audio codec it was loaded with changed).
+bool Player::ReloadPipeline(int64_t at_ms) {
+  Media& m = *media_;
+  LOG("reloading the pipeline at %" PRId64 " ms", at_ms);
+  UnloadPipeline();
+  av_seek_frame(m.format, -1, m.start_us + at_ms * 1000, AVSEEK_FLAG_BACKWARD);
+  if (m.annexb) av_bsf_flush(m.annexb);
+  if (m.to81) av_bsf_flush(m.to81);
+  if (m.transcoder) m.transcoder->Flush();
+  m.started = false;
+  m.first_fed_ns = -1;
+  m.anchor_pending = true;
+  m.initial_start = true;  // a fresh pipeline: the timeline starts at 0 again, shifted
+  m.fresh_start = false;
+  m.logged_aus = 0;
+  position_ns_ = 0;
+  pts_shift_ns_ = 0;
+  last_fed_video_ns_ = 0;
+  load_position_ms_ = at_ms;
+  ResetSubtitles();
+  return LoadPipeline();
 }
 
 bool Player::Open() {
@@ -388,35 +549,36 @@ bool Player::Open() {
   if (r < 0) {
     char err[128];
     av_strerror(r, err, sizeof err);
-    Emit({{"event", "error"}, {"message", std::string("Could not open the stream: ") + err}});
+    EmitError("open_failed", std::string("Could not open the stream: ") + err);
     return false;
   }
   if (avformat_find_stream_info(m.format, nullptr) < 0) {
-    Emit({{"event", "error"}, {"message", "Could not read the stream's tracks"}});
+    EmitError("open_failed", "Could not read the stream's tracks");
     return false;
   }
 
   m.video = av_find_best_stream(m.format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
   if (m.video < 0) {
-    Emit({{"event", "error"}, {"message", "The file has no video track"}});
+    EmitError("unsupported_codec", "The file has no video track");
     return false;
   }
   AVStream* vs = m.format->streams[m.video];
   m.video_codec = VideoCodecName(vs->codecpar->codec_id);
   if (!m.video_codec) {
-    Emit({{"event", "error"},
-          {"message", std::string("Video codec not supported yet: ") + avcodec_get_name(vs->codecpar->codec_id)}});
+    EmitError("unsupported_codec", std::string("Video codec not supported yet: ") + avcodec_get_name(vs->codecpar->codec_id));
     return false;
   }
   m.width = vs->codecpar->width;
   m.height = vs->codecpar->height;
   m.is_hevc = vs->codecpar->codec_id == AV_CODEC_ID_HEVC;
+  m.is_av1 = vs->codecpar->codec_id == AV_CODEC_ID_AV1;
   m.hdr_info = HdrInfoPayload(vs->codecpar, nullptr);
   m.frame_rate = vs->avg_frame_rate.num > 0 ? vs->avg_frame_rate : vs->r_frame_rate;
   if (const AVPacketSideData* sd = av_packet_side_data_get(vs->codecpar->coded_side_data,
                                                            vs->codecpar->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF)) {
     auto* dovi = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sd->data);
     m.dv_profile = dovi->dv_profile;
+    m.dv_source_profile = dovi->dv_profile;
     // Profile 7 (dual layer) is not decoded as Dolby Vision by LG TVs. Converted to 8.1 (the
     // enhancement layer dropped, each RPU rewritten as dovi_tool's mode 2 does) it plays as Dolby
     // Vision on its HDR10 base layer; without the conversion only the HDR10 base plays.
@@ -433,63 +595,33 @@ bool Player::Open() {
       }
       if (m.to81) m.dv_profile = 8;
     }
-    m.dv_declared = m.knobs.declare_dv && (m.dv_profile == 5 || m.dv_profile == 8);
+    m.dv_declared = m.knobs.declare_dv && (m.dv_profile == 5 || m.dv_profile == 8 || (m.is_av1 && m.dv_profile == 10));
     LOG("dolby vision profile %d level %d bl_compat %d el %d -> %s", dovi->dv_profile, dovi->dv_level,
         dovi->dv_bl_signal_compatibility_id, dovi->el_present_flag,
         m.to81 ? "converted to 8.1, declared" : m.dv_declared ? "declared" : p7 ? "base layer (8.1 conversion unavailable)" : "base layer");
   }
 
-  int a = options_.audio_stream;
-  if (a < 0 || a >= static_cast<int>(m.format->nb_streams) ||
-      m.format->streams[a]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
-    a = av_find_best_stream(m.format, AVMEDIA_TYPE_AUDIO, -1, m.video, nullptr, 0);
-  }
-  if (a >= 0) {
-    m.audio_codec = AudioCodecName(m.format->streams[a]->codecpar->codec_id);
-    if (m.audio_codec) {
-      m.audio = a;
-      const AVCodecParameters* ap = m.format->streams[a]->codecpar;
-      m.audio_channels = ap->ch_layout.nb_channels;
-      m.audio_rate = ap->sample_rate;
-      m.atmos = ap->codec_id == AV_CODEC_ID_EAC3 && ap->profile == AV_PROFILE_EAC3_DDP_ATMOS;
-    } else if (m.knobs.audio_transcode) {
-      // The TV cannot decode this one: decode it here and feed AC-3.
-      auto t = std::make_unique<AudioTranscoder>();
-      std::string error;
-      if (t->Open(m.format->streams[a]->codecpar, m.knobs.ac3_bitrate, m.knobs.eac3, &error)) {
-        LOG("audio re-encoded: %s", t->description().c_str());
-        m.audio = a;
-        // Plain AC-3 fed this way played muffled on the C1 (the pipeline reported no sample
-        // rate for it); E-AC-3 is declared with its rate (ac3PlusInfo) and plays clean.
-        m.audio_codec = m.knobs.eac3 ? "AC3 PLUS" : "AC3";
-        m.audio_channels = t->channels();
-        m.audio_rate = t->sample_rate();
-        m.transcoder = std::move(t);
-      } else {
-        LOG("audio %s cannot be re-encoded (%s): playing without sound",
-            avcodec_get_name(m.format->streams[a]->codecpar->codec_id), error.c_str());
-      }
-    } else {
-      LOG("audio %s not fed: playing without sound", avcodec_get_name(m.format->streams[a]->codecpar->codec_id));
-    }
-  }
-  for (unsigned i = 0; i < m.format->nb_streams; i++) {
-    if (static_cast<int>(i) != m.video && static_cast<int>(i) != m.audio) {
-      m.format->streams[i]->discard = AVDISCARD_ALL;
-    }
-  }
+  SetupAudio(options_.audio_stream);
+  SetupSubtitle(options_.subtitle_stream);
 
-  const char* bsf_name = vs->codecpar->codec_id == AV_CODEC_ID_HEVC ? "hevc_mp4toannexb" : "h264_mp4toannexb";
-  const AVBitStreamFilter* bsf = av_bsf_get_by_name(bsf_name);
-  if (!bsf || av_bsf_alloc(bsf, &m.annexb) < 0 ||
-      avcodec_parameters_copy(m.annexb->par_in, vs->codecpar) < 0) {
-    Emit({{"event", "error"}, {"message", "Could not prepare the video stream"}});
-    return false;
-  }
-  m.annexb->time_base_in = vs->time_base;
-  if (av_bsf_init(m.annexb) < 0) {
-    Emit({{"event", "error"}, {"message", "Could not prepare the video stream"}});
-    return false;
+
+  if (m.is_av1) {
+    // AV1: no Annex B conversion; temporal units are framed in FeedLoop (av1_obu.cc).
+    m.av1_config = Av1ConfigObus(vs->codecpar->extradata, vs->codecpar->extradata_size);
+    LOG("AV1: %zu bytes of configuration OBUs from the codec record", m.av1_config.size());
+  } else {
+    const char* bsf_name = m.is_hevc ? "hevc_mp4toannexb" : "h264_mp4toannexb";
+    const AVBitStreamFilter* bsf = av_bsf_get_by_name(bsf_name);
+    if (!bsf || av_bsf_alloc(bsf, &m.annexb) < 0 ||
+        avcodec_parameters_copy(m.annexb->par_in, vs->codecpar) < 0) {
+      EmitError("open_failed", "Could not prepare the video stream");
+      return false;
+    }
+    m.annexb->time_base_in = vs->time_base;
+    if (av_bsf_init(m.annexb) < 0) {
+      EmitError("open_failed", "Could not prepare the video stream");
+      return false;
+    }
   }
 
   if (m.hdr_info.empty() && m.is_hevc &&
@@ -515,7 +647,7 @@ bool Player::Open() {
     av_seek_frame(m.format, -1, m.format->start_time != AV_NOPTS_VALUE ? m.format->start_time : 0, AVSEEK_FLAG_BACKWARD);
     if (found) m.hdr_info = HdrInfoPayload(vs->codecpar, &sei);
   }
-  m.own_annexb = m.knobs.own_annexb &&
+  m.own_annexb = !m.is_av1 && m.knobs.own_annexb &&
                  ParameterSetsFromRecord(vs->codecpar->extradata, vs->codecpar->extradata_size, m.is_hevc,
                                          &m.params, &m.nal_length_size);
   LOG("video conversion: %s (%zu bytes of parameter sets, NAL length %d)",
@@ -526,6 +658,7 @@ bool Player::Open() {
       m.format->iformat->name, m.video, m.video_codec, m.width, m.height, m.audio,
       m.audio_codec ? m.audio_codec : "-", m.duration_ms, m.start_us);
 
+  load_position_ms_ = options_.start_ms;
   if (options_.start_ms > 0) {
     av_seek_frame(m.format, -1, m.start_us + options_.start_ms * 1000, AVSEEK_FLAG_BACKWARD);
     m.fresh_start = false;
@@ -533,6 +666,84 @@ bool Player::Open() {
   // The first picture fed is anchored like a seek (with Dolby Vision it must be an IDR).
   m.anchor_pending = true;
   return true;
+}
+
+// Picks the audio track (FFmpeg stream index; -1 or an unusable index: the file's default) and how
+// it is fed: as is when the TV decodes it, else decoded and re-encoded to E-AC-3. Other streams are
+// discarded. Called at open and when Dart switches track.
+void Player::SetupAudio(int requested) {
+  Media& m = *media_;
+  m.audio = -1;
+  m.audio_codec = nullptr;
+  m.audio_channels = 0;
+  m.audio_rate = 0;
+  m.atmos = false;
+  m.transcoder.reset();
+  int a = requested;
+  if (a < 0 || a >= static_cast<int>(m.format->nb_streams) ||
+      m.format->streams[a]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+    a = av_find_best_stream(m.format, AVMEDIA_TYPE_AUDIO, -1, m.video, nullptr, 0);
+  }
+  if (a >= 0) {
+    // At a speed other than 1x the sound is always decoded, time-stretched and re-encoded.
+    m.audio_codec = speed_permille_ == 1000 ? AudioCodecName(m.format->streams[a]->codecpar->codec_id) : nullptr;
+    if (m.audio_codec) {
+      m.audio = a;
+      const AVCodecParameters* ap = m.format->streams[a]->codecpar;
+      m.audio_channels = ap->ch_layout.nb_channels;
+      m.audio_rate = ap->sample_rate;
+      m.atmos = ap->codec_id == AV_CODEC_ID_EAC3 && ap->profile == AV_PROFILE_EAC3_DDP_ATMOS;
+    } else if (m.knobs.audio_transcode) {
+      // The TV cannot decode this one: decode it here and feed AC-3.
+      auto t = std::make_unique<AudioTranscoder>();
+      std::string error;
+      if (t->Open(m.format->streams[a]->codecpar, m.knobs.ac3_bitrate, m.knobs.eac3, &error, speed_permille_ / 1000.0)) {
+        LOG("audio re-encoded: %s", t->description().c_str());
+        m.audio = a;
+        // Plain AC-3 fed this way played muffled on the C1 (the pipeline reported no sample
+        // rate for it); E-AC-3 is declared with its rate (ac3PlusInfo) and plays clean.
+        m.audio_codec = m.knobs.eac3 ? "AC3 PLUS" : "AC3";
+        m.audio_channels = t->channels();
+        m.audio_rate = t->sample_rate();
+        m.transcoder = std::move(t);
+      } else {
+        LOG("audio %s cannot be re-encoded (%s): playing without sound",
+            avcodec_get_name(m.format->streams[a]->codecpar->codec_id), error.c_str());
+      }
+    } else {
+      LOG("audio %s not fed: playing without sound", avcodec_get_name(m.format->streams[a]->codecpar->codec_id));
+    }
+  }
+  for (unsigned i = 0; i < m.format->nb_streams; i++) {
+    const bool keep = static_cast<int>(i) == m.video || static_cast<int>(i) == m.audio || static_cast<int>(i) == m.subtitle;
+    m.format->streams[i]->discard = keep ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+  }
+}
+
+// The file's audio and subtitle tracks as a JSON array for Dart.
+std::string Player::TracksJson() {
+  Media& m = *media_;
+  std::string j = "[";
+  for (unsigned i = 0; i < m.format->nb_streams; i++) {
+    const AVStream* st = m.format->streams[i];
+    const AVCodecParameters* cp = st->codecpar;
+    if (cp->codec_type != AVMEDIA_TYPE_AUDIO && cp->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
+    const AVDictionaryEntry* lang = av_dict_get(st->metadata, "language", nullptr, 0);
+    const AVDictionaryEntry* title = av_dict_get(st->metadata, "title", nullptr, 0);
+    const bool audio = cp->codec_type == AVMEDIA_TYPE_AUDIO;
+    const bool image = !audio && (cp->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE || cp->codec_id == AV_CODEC_ID_DVD_SUBTITLE ||
+                                  cp->codec_id == AV_CODEC_ID_DVB_SUBTITLE);
+    if (j.size() > 1) j += ",";
+    j += "{\"index\":" + std::to_string(i) + ",\"type\":\"" + (audio ? "audio" : "subtitle") + "\",\"codec\":\"" +
+         avcodec_get_name(cp->codec_id) + "\"";
+    if (audio) j += ",\"channels\":" + std::to_string(cp->ch_layout.nb_channels);
+    if (!audio) j += std::string(",\"image\":") + (image ? "true" : "false");
+    if (lang) j += ",\"language\":\"" + JsonEscape(lang->value) + "\"";
+    if (title) j += ",\"title\":\"" + JsonEscape(title->value) + "\"";
+    j += std::string(",\"default\":") + ((st->disposition & AV_DISPOSITION_DEFAULT) ? "true" : "false");
+    j += std::string(",\"forced\":") + ((st->disposition & AV_DISPOSITION_FORCED) ? "true" : "false") + "}";
+  }
+  return j + "]";
 }
 
 bool Player::LoadPipeline() {
@@ -546,7 +757,10 @@ bool Player::LoadPipeline() {
   // The video's real frame rate (LG otherwise assumes 60), as webos-native-app-kit declares it.
   std::string fps;
   if (m.frame_rate.num > 0 && m.frame_rate.den > 0) {
-    fps = ",\"videoFpsValue\":" + std::to_string(m.frame_rate.num) + ",\"videoFpsScale\":" + std::to_string(m.frame_rate.den);
+    // At a speed the pipeline gets that many more pictures a second.
+    const int64_t sp = speed_permille_;
+    fps = ",\"videoFpsValue\":" + std::to_string(sp == 1000 ? m.frame_rate.num : m.frame_rate.num * sp) +
+          ",\"videoFpsScale\":" + std::to_string(sp == 1000 ? m.frame_rate.den : m.frame_rate.den * 1000LL);
   }
   // The picture's size, as Kodi declares it: the pipeline otherwise sets the decoder up from the
   // adaptive envelope alone.
@@ -581,7 +795,7 @@ bool Player::LoadPipeline() {
   live += ",\"seekMode\":\"keep-rate\",\"useDroppedFrameEvent\":true";
   std::string adaptive;
   {
-    bool big = m.width > 1920 || m.height > 1080 || std::strcmp(m.video_codec, "H265") == 0;
+    bool big = m.width > 1920 || m.height > 1080 || m.is_hevc || m.is_av1;
     if (m.knobs.adaptive) {
       adaptive = std::string(",\"adaptiveStreaming\":{\"audioOnly\":false") +
                  (m.frame_rate.num > 0 ? ",\"adaptiveResolution\":true" : "") + ",\"maxWidth\":" + std::to_string(big ? 3840 : 1920) +
@@ -615,7 +829,7 @@ bool Player::LoadPipeline() {
   }
   pipeline->notifyForeground();
   if (!pipeline->Load(payload, &Player::PipelineCallback, this)) {
-    Emit({{"event", "error"}, {"message", "The TV's media pipeline refused to load"}});
+    EmitError("load_refused", "The TV's media pipeline refused to load");
     return false;
   }
   loaded_ = true;
@@ -625,6 +839,34 @@ bool Player::LoadPipeline() {
   } else {
     LOG("no setHdrInfo (%s)", m.hdr_info.empty() ? "no HDR colour data in the container" : "off");
   }
+  {
+    EventMap info;
+    info["container"] = m.format->iformat->name;
+    info["videoCodec"] = m.video_codec;
+    info["width"] = std::to_string(m.width);
+    info["height"] = std::to_string(m.height);
+    if (m.frame_rate.num > 0 && m.frame_rate.den > 0) {
+      char fps[16];
+      snprintf(fps, sizeof fps, "%.3f", av_q2d(m.frame_rate));
+      info["fps"] = fps;
+    }
+    if (m.dv_source_profile) {
+      info["dolbyVision"] = m.to81 ? "profile 7, converted to 8.1"
+                            : m.dv_declared ? "profile " + std::to_string(m.dv_profile)
+                                            : "profile " + std::to_string(m.dv_source_profile) + ", HDR10 base layer only";
+    }
+    if (m.audio >= 0) {
+      const AVCodecParameters* ap = m.format->streams[m.audio]->codecpar;
+      info["audioSource"] = std::string(avcodec_get_name(ap->codec_id)) + " " + std::to_string(ap->ch_layout.nb_channels) + " ch";
+      info["audioOut"] = std::string(m.audio_codec ? m.audio_codec : "-") + " " + std::to_string(m.audio_channels) + " ch" +
+                         (m.atmos ? ", Atmos" : "");
+      info["audioPath"] = m.transcoder ? "decoded and re-encoded on the TV" : "fed as is";
+    } else {
+      info["audioPath"] = "none";
+    }
+    std::lock_guard<std::mutex> lock(info_mutex_);
+    info_ = std::move(info);
+  }
   // Play() waits for the first fed picture (FeedLoop): starting the clock with nothing decoded makes
   // a 4K decoder start behind.
   Emit({{"event", "initialized"},
@@ -632,7 +874,12 @@ bool Player::LoadPipeline() {
         {"width", std::to_string(m.width)},
         {"height", std::to_string(m.height)},
         {"videoCodec", m.video_codec},
-        {"audioCodec", m.audio_codec ? m.audio_codec : ""}});
+        {"audioCodec", m.audio_codec ? m.audio_codec : ""},
+        {"audioStream", std::to_string(m.audio)},
+        {"position", std::to_string(load_position_ms_)},
+        {"tracks", TracksJson()},
+        {"subtitleStream", std::to_string(m.subtitle)},
+        {"subtitleMode", SubtitleMode(ass_ != nullptr, m.subdec.get())}});
   return true;
 }
 
@@ -644,9 +891,10 @@ bool Player::FeedPacket(const uint8_t* data, int size, int64_t pts_ns, int es) {
   // (just after Load, around a seek); dropping the packet would corrupt every picture that refers
   // to it, so it is retried too, for up to 3 s.
   int errors = 0;
-  while (!stop_ && seek_request_ms_ < 0) {
+  while (!stop_ && !failed_ && seek_request_ms_ < 0) {
     std::string reply = pipeline_->Feed(json);
     if (reply.find("Ok") != std::string::npos) {
+      feed_drops_in_row_ = 0;
       if (errors > 0) {
         feed_error_retries_ += errors;
         LOG("feed es=%d accepted after %d error replies (pts %" PRId64 " ms)", es, errors, pts_ns / 1000000);
@@ -655,6 +903,9 @@ bool Player::FeedPacket(const uint8_t* data, int size, int64_t pts_ns, int es) {
     }
     if (reply.find("BufferFull") == std::string::npos && ++errors > 300) {
       LOG("feed es=%d dropped after %d error replies: %s", es, errors, reply.c_str());
+      if (++feed_drops_in_row_ >= 5) {
+        EmitError("feed_refused", "The TV's player stopped accepting the stream");
+      }
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -684,10 +935,86 @@ void Player::FeedLoop() {
   bool logged_position = false;
 
   while (!stop_) {
+    const int want_audio = audio_request_.exchange(-2);
+    if (want_audio != -2 && want_audio != m.audio) {
+      const std::string old_codec = m.audio_codec ? m.audio_codec : "";
+      const int old_channels = m.audio_channels;
+      const bool old_atmos = m.atmos;
+      const int64_t at = PositionMs();
+      SetupAudio(want_audio);
+      const std::string new_codec = m.audio_codec ? m.audio_codec : "";
+      {
+        std::lock_guard<std::mutex> lock(info_mutex_);
+        if (m.audio >= 0) {
+          const AVCodecParameters* ap = m.format->streams[m.audio]->codecpar;
+          info_["audioSource"] = std::string(avcodec_get_name(ap->codec_id)) + " " + std::to_string(ap->ch_layout.nb_channels) + " ch";
+          info_["audioOut"] = new_codec + " " + std::to_string(m.audio_channels) + " ch" + (m.atmos ? ", Atmos" : "");
+          info_["audioPath"] = m.transcoder ? "decoded and re-encoded on the TV" : "fed as is";
+        }
+      }
+      if (new_codec == old_codec && m.audio_channels == old_channels && m.atmos == old_atmos && !new_codec.empty()) {
+        LOG("audio track %d: same feed (%s %d ch), switching at %" PRId64 " ms", m.audio, new_codec.c_str(), m.audio_channels, at);
+        seek_request_ms_ = at;
+      } else {
+        LOG("audio track %d: %s %d ch instead of %s %d ch", m.audio, new_codec.c_str(), m.audio_channels, old_codec.c_str(), old_channels);
+        if (!ReloadPipeline(at)) break;
+        eos = false;
+      }
+      Emit({{"event", "audioChanged"}, {"audioStream", std::to_string(m.audio)}, {"audioCodec", new_codec}});
+    }
+    if (audio_delay_changed_.exchange(false) && m.started && !eos) {
+      LOG("audio delay %" PRId64 " ms", static_cast<int64_t>(audio_delay_ns_ / 1000000));
+      seek_request_ms_ = PositionMs();  // re-feed from the picture with the new offset
+    }
+    const int want_speed = speed_request_.exchange(-1);
+    if (want_speed > 0 && want_speed != speed_permille_) {
+      const int max = MaxSpeedPermille();
+      if (want_speed > max) {
+        LOG("speed %d refused: at most %d for %.3f fps", want_speed, max, av_q2d(m.frame_rate));
+        Emit({{"event", "speedRefused"}, {"speed", std::to_string(want_speed)}, {"maxSpeed", std::to_string(max)}});
+      } else {
+        const int64_t at = PositionMs();  // with the old speed
+        speed_permille_ = want_speed;
+        SetupAudio(m.audio);
+        {
+          std::lock_guard<std::mutex> lock(info_mutex_);
+          info_["audioOut"] = std::string(m.audio_codec ? m.audio_codec : "-") + " " + std::to_string(m.audio_channels) + " ch" +
+                              (m.atmos ? ", Atmos" : "");
+          info_["audioPath"] = m.transcoder ? (speed_permille_ == 1000 ? "decoded and re-encoded on the TV"
+                                                                       : "decoded, time-stretched and re-encoded on the TV")
+                                            : "fed as is";
+        }
+        LOG("speed %d at %" PRId64 " ms", want_speed, at);
+        if (!ReloadPipeline(at)) break;
+        eos = false;
+        Emit({{"event", "speedChanged"}, {"speed", std::to_string(want_speed)}});
+      }
+    }
+    const int want_sub = subtitle_request_.exchange(-2);
+    if (want_sub != -2 && want_sub != m.subtitle) {
+      SetupSubtitle(want_sub);
+      // The stream is read ahead of the picture: go back to the picture so the new track's cues
+      // for the next seconds are read too.
+      if (m.subtitle >= 0 && !eos) seek_request_ms_ = PositionMs();
+      bool is_ass;
+      {
+        std::lock_guard<std::mutex> lock(cue_mutex_);
+        is_ass = ass_ != nullptr;
+      }
+      Emit({{"event", "subtitleChanged"}, {"subtitleStream", std::to_string(m.subtitle)},
+            {"subtitleMode", SubtitleMode(is_ass, m.subdec.get())}});
+    }
     int64_t seek_ms = seek_request_ms_.exchange(-1);
+    if (seek_ms >= 0 && speed_permille_ != 1000) {
+      // At a speed the pipeline's timeline is scaled: a seek starts a fresh one.
+      if (!ReloadPipeline(seek_ms)) break;
+      eos = false;
+      seek_ms = -1;
+    }
     if (seek_ms >= 0) {
+      ResetSubtitles();
       av_seek_frame(m.format, -1, m.start_us + seek_ms * 1000, AVSEEK_FLAG_BACKWARD);
-      av_bsf_flush(m.annexb);
+      if (m.annexb) av_bsf_flush(m.annexb);
       if (m.to81) av_bsf_flush(m.to81);
       m.anchor_pending = true;
       m.fresh_start = false;
@@ -700,21 +1027,36 @@ void Player::FeedLoop() {
       continue;
     }
 
+    if (failed_) break;
+
     // Keep the feed a few seconds ahead of the picture.
     int64_t played_ns = position_ns_;
+    {
+      // Stall watchdog: playing, not paused or seeking, data fed beyond the picture, and the picture
+      // has not moved for kStallMs. LG's pipeline sometimes swallows a feed without an error.
+      auto now = std::chrono::steady_clock::now();
+      if (played_ns != m.watch_position_ns || paused_ || m.anchor_pending || !m.started) {
+        m.watch_position_ns = played_ns;
+        m.watch_since = now;
+      } else if (ToFedNs(last_fed_video_ns_) - played_ns > 500000000LL &&
+                 now - m.watch_since > std::chrono::milliseconds(kStallMs)) {
+        EmitError("stalled", "Playback stopped: the TV's player took the stream but shows no picture");
+        break;
+      }
+    }
     {
       auto now = std::chrono::steady_clock::now();
       if (played_ns > 0 && now - m.last_lead_log > std::chrono::seconds(5)) {
         m.last_lead_log = now;
         LOG("lead: fed %.2f s ahead of the picture (position %.1f s)",
-            (last_fed_video_ns_ - pts_shift_ns_ - played_ns) / 1e9, (played_ns + pts_shift_ns_) / 1e9);
+            (ToFedNs(last_fed_video_ns_) - played_ns) / 1e9, ToContentNs(played_ns) / 1e9);
       }
     }
     if (!logged_position && played_ns > 0) {
       LOG("first position %" PRId64 " ns (fed video up to %" PRId64 " ns)", played_ns, last_fed_video_ns_.load());
       logged_position = true;
     }
-    if (!m.anchor_pending && played_ns > 0 && last_fed_video_ns_ - pts_shift_ns_ - played_ns > kMaxFeedAheadNs) {
+    if (!m.anchor_pending && played_ns > 0 && ToFedNs(last_fed_video_ns_) - played_ns > kMaxFeedAheadNs) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
@@ -730,7 +1072,7 @@ void Player::FeedLoop() {
       if (stop_) break;
       char err[128];
       av_strerror(r, err, sizeof err);
-      Emit({{"event", "error"}, {"message", std::string("Reading the stream failed: ") + err}});
+      EmitError("read_failed", std::string("Reading the stream failed: ") + err);
       break;
     }
 
@@ -777,10 +1119,12 @@ void Player::FeedLoop() {
     if (packet->stream_index == m.video) {
       // MP4/MKV (length-prefixed): our own conversion, parameter sets only in front of keyframes
       // (ffmpeg's filter also repeats the codec record's SEI arrays). Annex B sources: the filter.
-      bool own = m.own_annexb;
+      bool own = m.own_annexb || m.is_av1;
       bool sent;
       if (own) {
-        sent = LengthPrefixedToAnnexB(packet->data, packet->size, m.nal_length_size, m.is_hevc, m.params, &m.conv);
+        sent = m.is_av1
+            ? Av1TemporalUnit(packet->data, packet->size, packet->flags & AV_PKT_FLAG_KEY, m.av1_config, &m.conv)
+            : LengthPrefixedToAnnexB(packet->data, packet->size, m.nal_length_size, m.is_hevc, m.params, &m.conv);
         if (sent) {
           av_packet_unref(out);
           sent = av_new_packet(out, static_cast<int>(m.conv.size())) == 0;
@@ -802,7 +1146,7 @@ void Player::FeedLoop() {
           if (m.anchor_pending) {
             // The C1's Dolby Vision splitter accepts only an IDR as the first picture after a start
             // or a seek (other random access pictures leave it buffering), so skip to one.
-            if (m.dv_declared) {
+            if (m.dv_declared && m.is_hevc) {
               int vcl = HevcFirstVclType(out->data, out->size);
               if (vcl != 19 && vcl != 20) {
                 if (m.non_idr_skipped++ < 3) LOG("start/seek: skipping a keyframe of NAL type %d (waiting for an IDR)", vcl);
@@ -864,9 +1208,10 @@ void Player::FeedLoop() {
             LOG("AU#%d size=%d nal types=[%s] head=[%s]", m.logged_aus, size, types.c_str(), head);
             m.logged_aus++;
           }
-          int64_t fed = ns - pts_shift_ns_ + m.knobs.pts_nudge_ns;
+          int64_t fed = ToFedNs(ns) + m.knobs.pts_nudge_ns;
           if (FeedPacket(data, size, fed > 0 ? fed : 0, 1)) {
             last_fed_video_ns_ = ns;
+            fed_video_bytes_ += size;
             if (m.first_fed_ns < 0) m.first_fed_ns = ns;
             // Prime about a second of pictures before the clock starts, as PlxNative does.
             if (!m.started && ns - m.first_fed_ns >= 1000000000LL) {
@@ -881,6 +1226,23 @@ void Player::FeedLoop() {
           release(out);
         }
       }
+    } else if (packet->stream_index == m.subtitle && !m.subdec) {
+      std::shared_ptr<AssRenderer> ass;
+      {
+        std::lock_guard<std::mutex> lock(cue_mutex_);
+        ass = ass_;
+      }
+      if (ass) {
+        const int64_t dur = packet->duration > 0 ? av_rescale_q(packet->duration, st->time_base, AVRational{1, 1000}) : 5000;
+        ass->AddEvent(packet, pts_ns / 1000000, dur);
+      }
+    } else if (packet->stream_index == m.subtitle && m.subdec) {
+      std::vector<SubtitleCue> decoded;
+      m.subdec->Decode(packet, pts_ns / 1000000, &decoded);
+      if (!decoded.empty()) {
+        std::lock_guard<std::mutex> lock(cue_mutex_);
+        for (auto& c : decoded) cues_.push_back(std::move(c));
+      }
     } else if (packet->stream_index == m.audio && m.transcoder) {
       m.transcoder->Push(packet, st->time_base, [&](const uint8_t* data, int size, int64_t ns) {
         if (m.knobs.dump_audio && m.dumped_bytes < 20 * 80000) {
@@ -890,7 +1252,7 @@ void Player::FeedLoop() {
           }
           m.dumped_bytes += size;
         }
-        FeedPacket(data, size, ns - m.start_us * 1000 - pts_shift_ns_, 2);
+        FeedPacket(data, size, ToFedNs(ns - m.start_us * 1000) + audio_delay_ns_, 2);
       });
     } else if (packet->stream_index == m.audio) {
       const AVCodecParameters* ap = st->codecpar;
@@ -900,9 +1262,9 @@ void Player::FeedLoop() {
           AdtsHeader(ap->extradata, ap->extradata_size, packet->size, adts)) {
         m.aac.assign(adts, adts + 7);
         m.aac.insert(m.aac.end(), packet->data, packet->data + packet->size);
-        FeedPacket(m.aac.data(), static_cast<int>(m.aac.size()), pts_ns - pts_shift_ns_, 2);
+        FeedPacket(m.aac.data(), static_cast<int>(m.aac.size()), ToFedNs(pts_ns) + audio_delay_ns_, 2);
       } else {
-        FeedPacket(packet->data, packet->size, pts_ns - pts_shift_ns_, 2);
+        FeedPacket(packet->data, packet->size, ToFedNs(pts_ns) + audio_delay_ns_, 2);
       }
       release(packet);
     }
@@ -931,10 +1293,24 @@ void Player::OnPipelineEvent(int type, long long num, const char* str) {
     unload_done_.notify_all();
     return;
   }
+  if (type == 4) {
+    size_t k = s.find("\"hdrType\":\"");
+    if (k != std::string::npos) {
+      size_t b = k + 11, e = s.find('"', b);
+      std::lock_guard<std::mutex> lock(info_mutex_);
+      hdr_type_ = s.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    }
+  }
   if (s.find("endOfStream") != std::string::npos) {
     Emit({{"event", "completed"}});
   } else if (type == 18) {
-    Emit({{"event", "error"}, {"message", "Playback error " + std::to_string(num) + (s.empty() ? "" : ": " + s)}});
+    // 601 "Resource Allocation Error": the decoder is held by another player (another app, or one
+    // still unloading).
+    if (num == 601 || s.find("Resource Allocation") != std::string::npos) {
+      EmitError("decoder_busy", "The TV's video decoder is in use by another app or player");
+    } else {
+      EmitError("pipeline_error", "The TV's player reported error " + std::to_string(num) + (s.empty() ? "" : ": " + s));
+    }
   } else if (type < 45) {
     Emit({{"event", "native"}, {"type", std::to_string(type)}, {"num", std::to_string(num)}, {"str", s}});
   }

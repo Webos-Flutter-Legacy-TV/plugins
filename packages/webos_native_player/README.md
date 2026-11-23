@@ -23,18 +23,35 @@ dependencies:
 ```
 
 ```dart
-final c = NativePlayerController('http://server/video.mkv', startAt: Duration.zero);
+final c = NativePlayerController('http://server/video.mkv',
+    startAt: Duration.zero, audioStream: null, subtitleStream: null, audioDelay: Duration.zero);
 await c.initialize();          // opens the file, loads the TV's pipeline
 await c.play();
-// Under a transparent page: Stack(children: [const NativeVideoView(), ...your controls])
-c.value;                       // position, duration, playing, completed, size, codecs, error
+// Under a transparent page:
+//   Stack(children: [const NativeVideoView(), NativeSubtitleView(controller: c), ...your controls])
+c.value;                       // position, duration, buffered, playing, completed, size, codecs,
+                               // tracks, audioStream, speed / maxSpeed, info, error / errorCode
 await c.seekTo(const Duration(minutes: 5));
+await c.setAudioStream(2);     // another audio track of the file, while playing
+await c.setSubtitleStream(17); // a subtitle track of the file (null: none)
+await c.setSpeed(1.5);         // 0.5 - 2.0, pitch kept
+await c.setAudioDelay(const Duration(milliseconds: 100));  // lip-sync
 await c.dispose();
 ```
 
 - The app's `webos/meta/appinfo.json` needs `"transparent": true`: the video is a plane under the
   Flutter surface, so nothing may paint over `NativeVideoView`.
-- `audioStream` picks an audio track by its FFmpeg stream index (default: the file's default track).
+- Track indexes are FFmpeg stream indexes (`value.tracks`: audio and subtitle tracks with codec,
+  language, title, channels, default / forced, picture or text).
+- `NativeSubtitleView` draws picture subtitles and ASS; set `drawText: false` to draw text cues
+  yourself from `controller.subtitle` (in your own style).
+- `value.errorCode` says why playback stopped: `decoder_busy` (another app or player holds the TV's
+  decoder), `stalled`, `feed_refused`, `load_refused`, `pipeline_error`, `open_failed`,
+  `read_failed`, `unsupported_codec`. An app can then play the title another way.
+- `value.info` is for a stats overlay: codecs, size, frame rate, the TV's own `hdrType`, Dolby
+  Vision handling, audio source / output / path, measured video bitrate, buffered seconds.
+- With `releaseInBackground` (default) the TV's decoder is released while the app is in the
+  background and playback reopens at the same position when it returns.
 - Sources: anything the bundled FFmpeg opens over HTTP or from a file (MKV, MP4, MPEG-TS, HLS).
 - [`example/`](example/) plays one URL given at build time; it is the smallest complete app.
 
@@ -53,6 +70,17 @@ Tested on an LG C1 (webOS 6.5.3):
   re-encoded to E-AC-3 5.1 / stereo at 640 kb/s (`audio_transcode.cc`); 7.1 is folded to 5.1.
   E-AC-3 rather than AC-3: AC-3 fed this way sounded muffled on the C1 (the pipeline reported no
   sample rate for it), E-AC-3 is declared with its rate. TrueHD 7.1 costs about 40 % of one core.
+- AV1 (8 and 10 bit, up to 4K), fed as temporal units with the codec record's configuration OBUs in
+  front of keyframes (`av1_obu.cc`); Dolby Vision profile 10 declared.
+- Subtitle tracks of the file: PGS / VobSub / DVB as pictures, ASS / SSA drawn with libass (the
+  file's attached fonts, `DroidSans` from the TV otherwise), SRT / WebVTT / mov_text as text cues.
+- Audio tracks switched while playing: a short internal seek when the new track is fed the same way,
+  else the pipeline is reloaded in the same window at the same position (the codec is fixed per Load).
+- Speed 0.5-2x: the pipeline cannot change rate in buffer-feed mode (PlxNative found the same), so
+  the plugin divides the timestamps it feeds by the speed and time-stretches the sound (`atempo`,
+  pitch kept) before re-encoding it; limited so that frame rate x speed stays within 60.
+- Lip-sync offset, errors with codes and a stall watchdog, playback information, decoder released
+  in the background.
 - Play, pause, seek (LG's public `Seek`, anchored on the landing keyframe, an IDR with Dolby Vision),
   starting part-way in (timeline shifted to 0: the pipeline refuses `Seek` before it plays),
   position from the frame-ready event, end of stream.
@@ -72,8 +100,7 @@ Test knobs: key=value lines in the app's `/tmp/webos_native_player.conf` change 
 details at the next open (see `Knobs` in `player.cc`); every pipeline callback is logged to the
 app's `compat.log` (`[native-player]` lines).
 
-Planned: in-file audio and subtitle tracks, picture subtitles (PGS, VobSub), DTS fed as is where
-the TV decodes it (`dts_restore`).
+Not done: DTS fed as is on TVs that decode it (the 2020-21 sets, the C1 among them, do not), VP9.
 
 ## Layout
 
@@ -82,6 +109,10 @@ the TV decodes it (`dts_restore`).
 - `webos/plugin.cc` — method channel `webos_native_player`, events `webos_native_player/events/<id>`.
 - `webos/audio_transcode.cc` — decode + E-AC-3 / AC-3 re-encode.
 - `webos/hevc_sei.cc` — Annex B conversion, HDR10+ removal, HDR SEI reading.
+- `webos/av1_obu.cc` — AV1 temporal units for the pipeline.
+- `webos/subtitles.cc` — subtitle decoding (pictures, text) and the libass renderer.
+- `webos/libass/` — libass 0.17.3 with HarfBuzz 10.1.0 and FreeType 2.13.3 (static) and FriBidi
+  1.0.16 (shared, LGPL-2.1), built by `tools/build-libass.sh` from the official release tarballs.
 - `webos/starfish.h` — LG's class (no public header exists); `starfish_stub.cc` only for linking.
 - `webos/ffmpeg/` — FFmpeg 7.1.1, LGPL-2.1, shared, built by `tools/build-ffmpeg.sh` from the
   official tarball (sha256 `733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1`)
@@ -93,7 +124,9 @@ the TV decodes it (`dts_restore`).
 The plugin's own code is BSD-3-Clause ([LICENSE](LICENSE)). The bundled FFmpeg is LGPL-2.1 or later,
 as shared libraries: apps may replace them, and the modified source is the official tarball plus
 `tools/ffmpeg-patches/` (`WEBOS_NDK_ENV=<LG NDK environment script> tools/build-ffmpeg.sh
-ffmpeg-7.1.1.tar.xz <out>` rebuilds them). `webos/starfish.h` declares the TV firmware's media
+ffmpeg-7.1.1.tar.xz <out>` rebuilds them). libass (ISC), HarfBuzz (MIT) and FreeType (FreeType
+licence) are linked in; FriBidi (LGPL-2.1) is bundled as the shared `libfribidi.so.0`, rebuilt with
+`tools/build-libass.sh`. `webos/starfish.h` declares the TV firmware's media
 class (LG publishes no header); the firmware library itself is not bundled.
 
 History: developed in Webos-Flutter-Legacy-TV/jellyfin-flutter (`packages/webos_native_player`)

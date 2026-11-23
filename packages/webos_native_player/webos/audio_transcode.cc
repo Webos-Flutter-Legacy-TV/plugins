@@ -2,11 +2,16 @@
 #include "audio_transcode.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/channel_layout.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 }
@@ -21,6 +26,9 @@ int Ac3Rate(int rate) { return rate == 48000 || rate == 44100 || rate == 32000 ?
 }  // namespace
 
 AudioTranscoder::~AudioTranscoder() {
+  CloseTempo();
+  av_frame_free(&tempo_in_);
+  av_frame_free(&tempo_out_);
   avcodec_free_context(&dec_);
   avcodec_free_context(&enc_);
   swr_free(&swr_);
@@ -30,7 +38,8 @@ AudioTranscoder::~AudioTranscoder() {
   av_packet_free(&enc_pkt_);
 }
 
-bool AudioTranscoder::Open(const AVCodecParameters* par, int bitrate, bool eac3, std::string* error) {
+bool AudioTranscoder::Open(const AVCodecParameters* par, int bitrate, bool eac3, std::string* error, double tempo) {
+  tempo_ = tempo;
   const AVCodec* dc = avcodec_find_decoder(par->codec_id);
   const AVCodec* ec = avcodec_find_encoder(eac3 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_AC3);
   if (!dc || !ec) {
@@ -85,7 +94,68 @@ bool AudioTranscoder::Open(const AVCodecParameters* par, int bitrate, bool eac3,
   av_channel_layout_describe(&par->ch_layout, layout, sizeof layout);
   description_ = std::string(avcodec_get_name(par->codec_id)) + " " + layout + (eac3 ? " -> E-AC-3 " : " -> AC-3 ") +
                  std::to_string(out_channels_) + " ch " + std::to_string(enc_->bit_rate / 1000) + " kb/s";
+  if (tempo_ != 1.0) {
+    tempo_in_ = av_frame_alloc();
+    tempo_out_ = av_frame_alloc();
+    if (!OpenTempo()) {
+      *error = "atempo filter setup failed";
+      return false;
+    }
+    char t[32];
+    snprintf(t, sizeof t, ", speed %.2fx", tempo_);
+    description_ += t;
+  }
   return true;
+}
+
+// abuffer -> atempo -> aformat (planar float) -> abuffersink, at the encoder's rate and layout.
+bool AudioTranscoder::OpenTempo() {
+  CloseTempo();
+  graph_ = avfilter_graph_alloc();
+  if (!graph_) return false;
+  char layout[64];
+  av_channel_layout_describe(&enc_->ch_layout, layout, sizeof layout);
+  char args[160];
+  snprintf(args, sizeof args, "sample_rate=%d:sample_fmt=fltp:channel_layout=%s:time_base=1/%d", out_rate_, layout, out_rate_);
+  AVFilterContext* tempo = nullptr;
+  AVFilterContext* format = nullptr;
+  char tempo_args[32];
+  snprintf(tempo_args, sizeof tempo_args, "tempo=%.4f", tempo_);
+  if (avfilter_graph_create_filter(&src_, avfilter_get_by_name("abuffer"), "in", args, nullptr, graph_) < 0 ||
+      avfilter_graph_create_filter(&tempo, avfilter_get_by_name("atempo"), "tempo", tempo_args, nullptr, graph_) < 0 ||
+      avfilter_graph_create_filter(&format, avfilter_get_by_name("aformat"), "fmt", "sample_fmts=fltp", nullptr, graph_) < 0 ||
+      avfilter_graph_create_filter(&sink_, avfilter_get_by_name("abuffersink"), "out", nullptr, nullptr, graph_) < 0 ||
+      avfilter_link(src_, 0, tempo, 0) < 0 || avfilter_link(tempo, 0, format, 0) < 0 || avfilter_link(format, 0, sink_, 0) < 0 ||
+      avfilter_graph_config(graph_, nullptr) < 0) {
+    CloseTempo();
+    return false;
+  }
+  return true;
+}
+
+void AudioTranscoder::CloseTempo() {
+  if (graph_) avfilter_graph_free(&graph_);
+  src_ = sink_ = nullptr;
+}
+
+// Resampled audio into the encoder's FIFO, through atempo when the speed is not 1x.
+void AudioTranscoder::WriteFifo(uint8_t** data, int samples) {
+  if (!graph_) {
+    av_audio_fifo_write(fifo_, reinterpret_cast<void**>(data), samples);
+    return;
+  }
+  av_frame_unref(tempo_in_);
+  tempo_in_->nb_samples = samples;
+  tempo_in_->format = AV_SAMPLE_FMT_FLTP;
+  tempo_in_->sample_rate = out_rate_;
+  av_channel_layout_copy(&tempo_in_->ch_layout, &enc_->ch_layout);
+  if (av_frame_get_buffer(tempo_in_, 0) < 0) return;
+  for (int c = 0; c < out_channels_; c++) memcpy(tempo_in_->data[c], data[c], static_cast<size_t>(samples) * sizeof(float));
+  if (av_buffersrc_add_frame(src_, tempo_in_) < 0) return;
+  while (av_buffersink_get_frame(sink_, tempo_out_) >= 0) {
+    av_audio_fifo_write(fifo_, reinterpret_cast<void**>(tempo_out_->extended_data), tempo_out_->nb_samples);
+    av_frame_unref(tempo_out_);
+  }
 }
 
 void AudioTranscoder::Flush() {
@@ -93,6 +163,7 @@ void AudioTranscoder::Flush() {
   if (enc_) avcodec_flush_buffers(enc_);
   if (fifo_) av_audio_fifo_reset(fifo_);
   if (swr_) swr_free(&swr_);
+  if (graph_) OpenTempo();  // atempo keeps history: a fresh one after a seek
   next_pts_ns_ = -1;
 }
 
@@ -125,7 +196,7 @@ void AudioTranscoder::Push(const AVPacket* packet, AVRational tb, const Output& 
     uint8_t** buf = nullptr;
     if (av_samples_alloc_array_and_samples(&buf, nullptr, out_channels_, max_out, AV_SAMPLE_FMT_FLTP, 0) >= 0) {
       int n = swr_convert(swr_, buf, max_out, const_cast<const uint8_t**>(frame_->extended_data), frame_->nb_samples);
-      if (n > 0) av_audio_fifo_write(fifo_, reinterpret_cast<void**>(buf), n);
+      if (n > 0) WriteFifo(buf, n);
       av_freep(&buf[0]);
       av_freep(&buf);
     }
@@ -148,7 +219,8 @@ void AudioTranscoder::Encode(const Output& out, bool drain) {
       for (int c = 0; c < out_channels_; c++) reinterpret_cast<float*>(enc_frame_->data[c])[i] = 0.f;
     }
     int64_t pts_ns = next_pts_ns_;
-    next_pts_ns_ += av_rescale(got, 1000000000LL, out_rate_);
+    // Source time consumed: at a speed, each output sample stands for `tempo` source samples.
+    next_pts_ns_ += static_cast<int64_t>(av_rescale(got, 1000000000LL, out_rate_) * tempo_);
     if (avcodec_send_frame(enc_, enc_frame_) < 0) continue;
     while (avcodec_receive_packet(enc_, enc_pkt_) == 0) {
       out(enc_pkt_->data, enc_pkt_->size, pts_ns);

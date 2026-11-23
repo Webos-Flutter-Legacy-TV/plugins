@@ -3,7 +3,8 @@
 //
 //   flutter-webos build webos --release --dart-define=VIDEO_URL=http://<server>/<file>.mkv
 //
-// Remote: OK pauses / resumes, Left / Right seek 10 s, Back exits.
+// Remote: OK pauses / resumes, Left / Right seek 10 s, Up changes the speed (1, 1.5, 2, 0.5x),
+// Down picks the next audio track, Back exits.
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:webos_native_player/webos_native_player.dart';
@@ -61,6 +62,15 @@ class _PlayerPageState extends State<PlayerPage> {
       v.playing ? c.pause() : c.play();
     } else if (k == LogicalKeyboardKey.arrowRight) {
       c.seekTo(v.position + const Duration(seconds: 10));
+    } else if (k == LogicalKeyboardKey.arrowUp) {
+      const speeds = [1.0, 1.5, 2.0, 0.5];
+      c.setSpeed(speeds[(speeds.indexOf(v.speed) + 1) % speeds.length]);
+    } else if (k == LogicalKeyboardKey.arrowDown) {
+      final audio = [for (final t in v.tracks) if (t.isAudio) t];
+      if (audio.length > 1) {
+        final i = audio.indexWhere((t) => t.index == v.audioStream);
+        c.setAudioStream(audio[(i + 1) % audio.length].index);
+      }
     } else if (k == LogicalKeyboardKey.arrowLeft) {
       final to = v.position - const Duration(seconds: 10);
       c.seekTo(to < Duration.zero ? Duration.zero : to);
@@ -68,6 +78,13 @@ class _PlayerPageState extends State<PlayerPage> {
       return KeyEventResult.ignored;
     }
     return KeyEventResult.handled;
+  }
+
+  static String _audioLine(NativePlayerValue v) {
+    final audio = [for (final t in v.tracks) if (t.isAudio) t];
+    if (audio.length < 2) return '';
+    final cur = audio.where((t) => t.index == v.audioStream).firstOrNull;
+    return '\nAudio ${audio.indexOf(cur ?? audio.first) + 1}/${audio.length}: ${cur?.title ?? cur?.codec ?? '?'}   (Down: next)';
   }
 
   static String _t(Duration d) =>
@@ -83,7 +100,8 @@ class _PlayerPageState extends State<PlayerPage> {
             (v == null || !v.initialized
                 ? 'Loading…'
                 : '${v.videoCodec} ${v.size.width.toInt()}x${v.size.height.toInt()}, ${v.audioCodec}   '
-                    '${_t(v.position)} / ${_t(v.duration)}${v.playing ? '' : '   paused'}${v.completed ? '   ended' : ''}');
+                    '${_t(v.position)} / ${_t(v.duration)}${v.speed != 1.0 ? '   ${v.speed}x' : ''}${v.playing ? '' : '   paused'}${v.completed ? '   ended' : ''}'
+                    '${_audioLine(v)}');
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Focus(

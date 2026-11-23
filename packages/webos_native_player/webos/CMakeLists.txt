@@ -7,10 +7,20 @@ pkg_check_modules(GLIB REQUIRED glib-2.0)
 
 set(PLUGIN_NAME "webos_native_player_plugin")
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg")
+# libass (ASS/SSA rendering) with HarfBuzz and FreeType linked in; FriBidi (LGPL) shared and bundled.
+# Built by tools/build-libass.sh.
+set(LIBASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libass")
+set(LIBASS_STATIC
+  "${LIBASS_DIR}/lib/libass.a"
+  "${LIBASS_DIR}/lib/libharfbuzz.a"
+  "${LIBASS_DIR}/lib/libfreetype.a"
+)
+set(FRIBIDI_LIB "${LIBASS_DIR}/lib/libfribidi.so.0")
 set(FFMPEG_LIBS
   "${FFMPEG_DIR}/lib/libavformat.so.61"
   "${FFMPEG_DIR}/lib/libavcodec.so.61"
   "${FFMPEG_DIR}/lib/libswresample.so.5"
+  "${FFMPEG_DIR}/lib/libavfilter.so.10"
   "${FFMPEG_DIR}/lib/libavutil.so.59"
 )
 
@@ -23,6 +33,8 @@ add_library(${PLUGIN_NAME} SHARED
   "plugin.cc"
   "player.cc"
   "hevc_sei.cc"
+  "av1_obu.cc"
+  "subtitles.cc"
   "audio_transcode.cc"
 )
 apply_standard_settings(${PLUGIN_NAME})
@@ -32,15 +44,18 @@ target_include_directories(${PLUGIN_NAME} INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}
 target_include_directories(${PLUGIN_NAME} PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${FFMPEG_DIR}/include"
+  "${LIBASS_DIR}/include"
   ${GLIB_INCLUDE_DIRS}
 )
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   playerAPIs_stub
   ${FFMPEG_LIBS}
+  ${LIBASS_STATIC}
+  ${FRIBIDI_LIB}
   ${GLIB_LIBRARIES}
   pthread
 )
 
 # Shipped next to the plugin in the app's lib/ (LGPL: shared, replaceable).
-set(webos_native_player_bundled_libraries ${FFMPEG_LIBS} PARENT_SCOPE)
+set(webos_native_player_bundled_libraries ${FFMPEG_LIBS} ${FRIBIDI_LIB} PARENT_SCOPE)
