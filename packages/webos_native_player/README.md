@@ -34,6 +34,7 @@ c.value;                       // position, duration, buffered, playing, complet
 await c.seekTo(const Duration(minutes: 5));
 await c.setAudioStream(2);     // another audio track of the file, while playing
 await c.setSubtitleStream(17); // a subtitle track of the file (null: none)
+await c.setExternalAss(assText); // an external ASS / SSA file (its text) drawn with libass (null: none)
 await c.setSpeed(1.5);         // 0.5 - 2.0, pitch kept
 await c.setAudioDelay(const Duration(milliseconds: 100));  // lip-sync
 await c.dispose();

@@ -55,6 +55,9 @@ class Player {
   // reloads the pipeline at the position. Refused (event "speedRefused") above what the frame rate
   // allows (the pipeline takes at most 60 pictures a second).
   void SetSpeed(int permille);
+  // An external ASS / SSA subtitle file (its text, UTF-8) drawn with libass, replacing the file's
+  // own subtitle track; empty: none. False when libass cannot read it (error in *error).
+  bool SetExternalAss(const std::string& text, std::string* error);
   // Cues decoded since the last call. *generation changes when earlier cues no longer apply (after a
   // seek or a track change): the caller then drops what it has.
   std::vector<SubtitleCue> TakeSubtitles(int* generation);
@@ -108,6 +111,7 @@ class Player {
   std::vector<SubtitleCue> cues_;
   int cue_generation_ = 0;
   std::shared_ptr<AssRenderer> ass_;   // guarded by cue_mutex_
+  std::shared_ptr<AssRenderer> ext_ass_;  // an external ASS file; guarded by cue_mutex_
   int64_t load_position_ms_ = 0;          // where the current pipeline load starts
   std::atomic<int64_t> last_fed_video_ns_{0};
   std::atomic<int64_t> position_ns_{0};

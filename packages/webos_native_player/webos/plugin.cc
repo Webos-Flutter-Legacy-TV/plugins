@@ -151,6 +151,13 @@ class NativePlayerPlugin : public flutter::Plugin {
     } else if (method == "setSubtitleStream") {
       player.SetSubtitleStream(static_cast<int>(IntArg(a, "index", -1)));
       result->Success();
+    } else if (method == "setExternalAss") {
+      std::string error;
+      if (player.SetExternalAss(StringArg(a, "text"), &error)) {
+        result->Success(EncodableValue(true));
+      } else {
+        result->Error("ass_failed", error);
+      }
     } else if (method == "subtitles") {
       int generation = 0;
       flutter::EncodableList cues;

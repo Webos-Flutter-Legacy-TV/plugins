@@ -56,6 +56,9 @@ class AssRenderer {
   // file's font attachments. default_font: a font file for styles whose font is not attached.
   bool Open(const AVStream* stream, const struct AVFormatContext* format, const std::string& default_font,
             int video_width, int video_height, std::string* error);
+  // A whole ASS / SSA file given as text (an external subtitle file, UTF-8): every event at once.
+  bool OpenText(const std::string& text, const std::string& default_font, int video_width, int video_height,
+                std::string* error);
   void AddEvent(const AVPacket* packet, int64_t pts_ms, int64_t duration_ms);
   void Flush();
   // The frame at time_ms on a canvas_w x canvas_h canvas, as one image covering everything drawn

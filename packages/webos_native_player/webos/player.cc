@@ -424,7 +424,7 @@ bool Player::RenderAss(int64_t time_ms, int canvas_w, int canvas_h, SubtitleImag
   std::shared_ptr<AssRenderer> ass;
   {
     std::lock_guard<std::mutex> lock(cue_mutex_);
-    ass = ass_;
+    ass = ass_ ? ass_ : ext_ass_;
   }
   return ass && ass->Render(time_ms, canvas_w, canvas_h, out);
 }
@@ -434,7 +434,27 @@ static const char* SubtitleMode(bool ass, const SubtitleDecoder* dec) {
   return ass ? "ass" : !dec ? "none" : dec->image_based() ? "pictures" : "text";
 }
 
-// The subtitle track decoded for Dart (-1 or an unusable index: none).
+bool Player::SetExternalAss(const std::string& text, std::string* error) {
+  if (text.empty()) {
+    std::lock_guard<std::mutex> lock(cue_mutex_);
+    ext_ass_.reset();
+    return true;
+  }
+  // The video size is set once when the stream opens (before Dart can ask for this).
+  const int w = media_ ? media_->width : 0, h = media_ ? media_->height : 0;
+  auto ass = std::make_shared<AssRenderer>();
+  if (!ass->OpenText(text, kDefaultFont, w, h, error)) {
+    LOG("subtitles: external ASS not drawn (%s)", error->c_str());
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(cue_mutex_);
+  ext_ass_ = std::move(ass);
+  LOG("subtitles: external ASS file (%zu bytes, drawn with libass)", text.size());
+  return true;
+}
+
+// The subtitle track decoded for Dart (-1 or an unusable index: none). A track of the file
+// replaces an external ASS file.
 void Player::SetupSubtitle(int requested) {
   Media& m = *media_;
   m.subtitle = -1;
@@ -442,6 +462,7 @@ void Player::SetupSubtitle(int requested) {
   {
     std::lock_guard<std::mutex> lock(cue_mutex_);
     ass_.reset();
+    if (requested >= 0) ext_ass_.reset();
   }
   const AVCodecID id = requested >= 0 && requested < static_cast<int>(m.format->nb_streams)
                            ? m.format->streams[requested]->codecpar->codec_id : AV_CODEC_ID_NONE;
@@ -999,7 +1020,7 @@ void Player::FeedLoop() {
       bool is_ass;
       {
         std::lock_guard<std::mutex> lock(cue_mutex_);
-        is_ass = ass_ != nullptr;
+        is_ass = ass_ != nullptr || ext_ass_ != nullptr;
       }
       Emit({{"event", "subtitleChanged"}, {"subtitleStream", std::to_string(m.subtitle)},
             {"subtitleMode", SubtitleMode(is_ass, m.subdec.get())}});

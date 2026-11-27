@@ -181,6 +181,28 @@ bool AssRenderer::Open(const AVStream* stream, const AVFormatContext* format, co
   return true;
 }
 
+bool AssRenderer::OpenText(const std::string& text, const std::string& default_font, int video_width,
+                           int video_height, std::string* error) {
+  State& st = *s_;
+  st.library = ass_library_init();
+  if (!st.library) {
+    *error = "libass did not start";
+    return false;
+  }
+  ass_set_extract_fonts(st.library, 0);
+  st.renderer = ass_renderer_init(st.library);
+  std::vector<char> buf(text.begin(), text.end());
+  st.track = buf.empty() ? nullptr : ass_read_memory(st.library, buf.data(), buf.size(), nullptr);
+  if (!st.renderer || !st.track) {
+    *error = "libass could not read the subtitle file";
+    return false;
+  }
+  ass_set_fonts(st.renderer, default_font.empty() ? nullptr : default_font.c_str(), "sans-serif",
+                ASS_FONTPROVIDER_NONE, nullptr, 0);
+  if (video_width > 0 && video_height > 0) ass_set_storage_size(st.renderer, video_width, video_height);
+  return st.track->n_events > 0 || (*error = "the subtitle file has no events", false);
+}
+
 void AssRenderer::AddEvent(const AVPacket* packet, int64_t pts_ms, int64_t duration_ms) {
   std::lock_guard<std::mutex> lock(s_->mutex);
   if (!s_->track || !packet->data || packet->size <= 0) return;

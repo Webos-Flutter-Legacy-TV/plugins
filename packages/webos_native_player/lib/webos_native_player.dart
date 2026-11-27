@@ -249,7 +249,9 @@ class NativePlayerController extends ValueNotifier<NativePlayerValue> with Widge
         _placeWindow(value.size);
         if (ready != null && !ready.isCompleted) ready.complete();
       case 'subtitleChanged':
-        _subtitleMode = e['subtitleMode'] ?? 'none';
+        // With an external ASS file and no track of the file, libass keeps drawing the file.
+        final ext = _externalAss != null && _externalAss!.isNotEmpty && (e['subtitleStream'] ?? '-1') == '-1';
+        _subtitleMode = ext ? 'ass' : (e['subtitleMode'] ?? 'none');
         subtitle.value = const NativeSubtitle();
       case 'speedChanged':
         value = value.copyWith(speed: (int.tryParse(e['speed'] ?? '') ?? 1000) / 1000);
@@ -405,11 +407,30 @@ class NativePlayerController extends ValueNotifier<NativePlayerValue> with Widge
   /// [NativeSubtitleView] / [subtitle].
   Future<void> setSubtitleStream(int? index) async {
     _subtitleStream = index;
+    if (index != null) _externalAss = null;
     _cues.clear();
     subtitle.value = const NativeSubtitle();
     if (_id == null) return;
     await _channel.invokeMethod('setSubtitleStream', {'id': _id, 'index': index ?? -1});
   }
+
+  /// Draws an external ASS / SSA subtitle file (its text, UTF-8) with libass, with its own
+  /// styles, positions and animation, in place of the file's subtitle track; null: none.
+  /// Throws a [PlatformException] when libass cannot read the file.
+  Future<void> setExternalAss(String? text) async {
+    _cues.clear();
+    subtitle.value = const NativeSubtitle();
+    if (text != null && text.isNotEmpty) {
+      _subtitleStream = null;
+      if (_id != null) await _channel.invokeMethod('setSubtitleStream', {'id': _id, 'index': -1});
+    }
+    _externalAss = text;
+    if (_id == null) return;
+    await _channel.invokeMethod('setExternalAss', {'id': _id, 'text': text ?? ''});
+    _subtitleMode = text == null || text.isEmpty ? 'none' : 'ass';
+  }
+
+  String? _externalAss;
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -438,6 +459,7 @@ class NativePlayerController extends ValueNotifier<NativePlayerValue> with Widge
       final speed = value.speed;
       await _open(value.position, _audioOverride ?? audioStream);
       if (speed != 1.0) await setSpeed(speed);
+      if (_externalAss != null && _externalAss!.isNotEmpty) await setExternalAss(_externalAss);
       if (!_playingBeforeSuspend) await pause();
     } on Object catch (e) {
       debugPrint('webos_native_player: reopening after the background failed: $e');
